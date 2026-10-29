@@ -4,6 +4,8 @@
 
 ### New Features
 
+- On iPhone and iPad, insert a verification code through the system AutoFill text menu when an app does not recognize its code field.
+
 - On Mac, use SSH keys stored in KeeForge with `ssh`, `git`, and other SSH clients (#163). Turn on Settings → SSH Agent → "Enable SSH Agent", click "Copy SSH Configuration" and paste it into `~/.ssh/config`, then choose which keys of the unlocked database the agent offers. KeeForge uses an entry's attached OpenSSH private key, including entries set up with KeeAgent, KeePassXC, or Strongbox; Ed25519, ECDSA, and RSA keys without a passphrase are supported, and other keys are listed with the reason they can't be used. Keys are only available while their database is unlocked: locking or closing it makes them unavailable right away, and no key file is written to disk. The agent is off until you turn it on.
 - Face ID, Touch ID, and Apple Watch stop unlocking a database 14 days after its master password was last entered, in the app and in AutoFill, until you enter it again. This keeps a saved unlock key from staying on the device indefinitely and helps you remember the password. Choose 30 days or turn it off in Settings → Security → Require Master Password. After updating, the 14 days start with your next unlock.
 - Generate word-based passphrases on iPhone, iPad, and Mac with a chosen word count and separator. The saved mode and options also apply to iOS AutoFill generation (#187).
@@ -14,6 +16,8 @@
 - Face ID, Touch ID, and Apple Watch unlock, in the app and in AutoFill, open an unchanged database without repeating the key derivation, often the slowest part of unlocking. KeeForge keeps the derived key for the version it last opened or saved, with the same Keychain protection as the saved unlock key, and runs the full derivation again whenever the file has changed elsewhere. Databases that need a YubiKey always run it.
 
 ### Fixes
+
+- AutoFill lists prioritize credentials for the most specific requested website, and search includes additional URLs.
 
 - In Mac AutoFill, a few error messages (such as the one for a database in the Trash) now appear in your language instead of English.
 

@@ -674,9 +674,9 @@ final class CredentialProviderCoordinatorTests: XCTestCase {
         XCTAssertNil(presenter.completedOneTimeCode, "A list request must not answer itself with a code")
         let searchView = try XCTUnwrap(presenter.searchView)
         XCTAssertEqual(
-            searchView.entries.map(\.title).sorted(),
-            ["Root", "Specific"],
-            "Both hosts under the requested domain are offered"
+            searchView.entries.map(\.title),
+            ["Specific", "Root"],
+            "The most specific host is offered first"
         )
 
         searchView.onSelect(specific)
@@ -684,6 +684,36 @@ final class CredentialProviderCoordinatorTests: XCTestCase {
         XCTAssertNotNil(presenter.completedOneTimeCode)
         assertCleanedUp(coordinator)
     }
+
+    #if os(iOS)
+    func testTextInsertionOffersCodesAndCleansUpAfterSelection() throws {
+        let (coordinator, presenter) = makeCoordinator()
+        let key = SymmetricKey(size: .bits256)
+        let entry = try makeTOTPEntry(title: "Example", sessionKey: key)
+        coordinator.prepareTextInsertion()
+        seedUnlockedVaultState(coordinator, entries: [entry], sessionKey: key)
+        coordinator.presentTextInsertionPicker()
+
+        let picker = try XCTUnwrap(presenter.searchView)
+        XCTAssertNil(presenter.completedOneTimeCode)
+        picker.onSelect(entry)
+        XCTAssertEqual(presenter.completedOneTimeCode?.count, 6)
+        assertCleanedUp(coordinator)
+    }
+
+    func testTextInsertionCancelCleansUpWithoutReturningCode() throws {
+        let (coordinator, presenter) = makeCoordinator()
+        let key = SymmetricKey(size: .bits256)
+        let entry = try makeTOTPEntry(title: "Example", sessionKey: key)
+        coordinator.prepareTextInsertion()
+        seedUnlockedVaultState(coordinator, entries: [entry], sessionKey: key)
+        coordinator.presentTextInsertionPicker()
+        try XCTUnwrap(presenter.searchView).onCancel()
+        XCTAssertNil(presenter.completedOneTimeCode)
+        XCTAssertEqual(presenter.cancelledError?.code, .userCanceled)
+        assertCleanedUp(coordinator)
+    }
+    #endif
 
     func test_otcList_pickerStillOffersSubstringOnlyCandidates() throws {
         guard #available(iOS 18.0, macOS 15.0, *) else {

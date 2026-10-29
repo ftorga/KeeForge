@@ -39,6 +39,7 @@
 - An `.app` service identifier (an App ID such as `TEAMID.com.example.app`) is never parsed as a host: `searchTerm(for:)` returns nil. Reverse-DNS App IDs end in real TLDs and would strictly match an unrelated website.
 - Entries saved before that rule hold a raw App ID as a URL. Read entry URLs for AutoFill through `CredentialMatcher.webURLs(of:)`, which drops such a field without rewriting the entry.
 - Strict matching decides the exact section and the silent fill; broad matching only decides what a picker lists (`../../../AutoFillExtension/AGENTS.md`).
+- Interactive lists prioritize exact hosts and then subdomains in service-identifier order; this ordering does not change the set of silent-fill candidates.
 - Registrable-domain boundaries come from the embedded Public Suffix List (`swift-psl`), not from string heuristics.
 
 ### Memory pre-flight and settings

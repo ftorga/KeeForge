@@ -166,6 +166,9 @@ protocol CredentialProviderPresenting: AnyObject {
     /// Only reachable on iOS 18+ (one-time-code requests); the shell wraps the
     /// code in `ASOneTimeCodeCredential` under its own availability check.
     func completeOneTimeCodeRequest(code: String)
+    #if os(iOS)
+    func completeTextInsertion(_ text: String)
+    #endif
     /// Only reachable on iOS 26.2+ (save-password requests).
     func completeSavePasswordRequest()
     /// Only reachable on iOS 26.2+ (generate-password requests); the shell wraps
@@ -218,6 +221,9 @@ final class CredentialProviderCoordinator {
     var pendingPasskeyRegistrationFailureMessage: String?
     var hasPendingOTCRequest = false
     var hasPendingOTCListRequest = false
+    #if os(iOS)
+    var hasPendingTextInsertion = false
+    #endif
     var pendingGeneratePasswordPresentation = false
     /// Deferred presentation of the zero-enabled-databases empty state, used
     /// by request entry points that run before the shell is on screen (the
@@ -331,7 +337,27 @@ final class CredentialProviderCoordinator {
         isUnlockInProgress = false
         didFinishRequest = false
         pendingPresentation = nil
+        #if os(iOS)
+        hasPendingTextInsertion = false
+        #endif
     }
+
+    #if os(iOS)
+    func prepareTextInsertion() {
+        beginRequest()
+        serviceIdentifiers = []
+        targetRecordIdentifier = nil
+        pendingPasskeyRequest = nil
+        pendingPasskeyRequestParameters = nil
+        hasPendingOTCRequest = false
+        hasPendingOTCListRequest = false
+        clearPendingCreationRequests()
+        hasPendingTextInsertion = true
+        didAttemptAutoBiometricUnlock = false
+        pendingUnlock = true
+        activatePresentationIfPossible()
+    }
+    #endif
 
     private func isRequestActive(_ generation: Int) -> Bool {
         !didFinishRequest && requestGeneration == generation
@@ -1224,6 +1250,8 @@ final class CredentialProviderCoordinator {
             // Handled by the iOS-only save-password flow.
         } else if let requestParameters = pendingPasskeyRequestParameters {
             presentPasskeyMatchesOrFinish(using: requestParameters)
+        } else if hasPendingTextInsertionRequest {
+            presentTextInsertionPicker()
         } else if hasPendingOTCRequest {
             if #available(iOS 18.0, macOS 15.0, *) {
                 completeOTCRequestFromPending()
@@ -1237,6 +1265,29 @@ final class CredentialProviderCoordinator {
         } else {
             presentPasswordMatchesOrFinish()
         }
+    }
+
+    private var hasPendingTextInsertionRequest: Bool {
+        #if os(iOS)
+        return hasPendingTextInsertion
+        #else
+        return false
+        #endif
+    }
+
+    func presentTextInsertionPicker() {
+        #if os(iOS)
+        let generation = requestGeneration
+        let databaseID = activeDatabaseReference?.id
+        let entries = parsedEntries.filter(\.hasTOTP)
+        presentSearchView(entries: entries, includesDatabaseSwitcher: true) { [weak self] entry in
+            guard let self, self.isRequestActive(generation), self.activeDatabaseReference?.id == databaseID else { return }
+            guard let config = entry.totpConfig, let key = self.sessionKey else { self.cancelRequest(code: .failed); return }
+            let code = TOTPGenerator.generateCode(config: config, sessionKey: key)
+            guard code != "------" else { self.cancelRequest(code: .failed); return }
+            self.finishRequest { $0.completeTextInsertion(code) }
+        }
+        #endif
     }
 
     /// Handles a pending save-password request after unlock. Save-password is
@@ -1552,12 +1603,12 @@ final class CredentialProviderCoordinator {
         // `.stale` case, which clears the target), and `presentPasskeyList`'s
         // no-passkey fallback. The by-identity branch above still fills.
 
-        let searchDomain = serviceIdentifiers.first.flatMap { CredentialMatcher.searchTerm(for: $0) } ?? ""
+        let searchDomain = serviceIdentifiers.lazy.compactMap { CredentialMatcher.searchTerm(for: $0) }.first ?? ""
 
         if !strictMatches.isEmpty {
             // Only strict host matches belong in the exact interactive section.
             presentSearchView(
-                entries: strictMatches,
+                entries: CredentialMatcher.prioritizingHosts(strictMatches, for: serviceIdentifiers),
                 searchEntries: allPasswordEntries,
                 possibleEntries: [],
                 initialSearchText: "",
@@ -2386,13 +2437,13 @@ final class CredentialProviderCoordinator {
 
         let matches = CredentialMatcher.matchedEntries(from: totpEntries, for: serviceIdentifiers)
 
-        let searchDomain = serviceIdentifiers.first.flatMap { CredentialMatcher.searchTerm(for: $0) } ?? ""
+        let searchDomain = serviceIdentifiers.lazy.compactMap { CredentialMatcher.searchTerm(for: $0) }.first ?? ""
 
         if !matches.isEmpty {
             // Narrowed to matches, but the whole TOTP corpus stays the search
             // and "Show All Credentials" set — as on the password path.
             presentSearchView(
-                entries: matches,
+                entries: CredentialMatcher.prioritizingHosts(matches, for: serviceIdentifiers),
                 searchEntries: allTOTPEntries,
                 initialSearchText: "",
                 includesDatabaseSwitcher: true
@@ -2446,6 +2497,9 @@ final class CredentialProviderCoordinator {
         pendingPasskeyRequestParameters = nil
         hasPendingOTCRequest = false
         hasPendingOTCListRequest = false
+        #if os(iOS)
+        hasPendingTextInsertion = false
+        #endif
         pendingSwitchPreviousDatabaseReference = nil
         pendingSwitchSearchText = nil
         pendingPresentation = nil

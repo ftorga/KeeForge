@@ -4,6 +4,18 @@ import XCTest
 
 final class CredentialMatcherTests: XCTestCase {
 
+    func testPrioritizesExactHostAndIdentifierOrder() {
+        let entries = [
+            makeEntry(title: "Sibling", url: "https://other.example.com", username: "u", password: "p"),
+            makeEntry(title: "Child", url: "https://child.vt.example.com", username: "u", password: "p"),
+            makeEntry(title: "Exact", url: "https://vt.example.com", username: "u", password: "p"),
+        ]
+        let identifiers = ["vt.example.com", "example.com"].map {
+            ASCredentialServiceIdentifier(identifier: $0, type: .domain)
+        }
+        XCTAssertEqual(CredentialMatcher.prioritizingHosts(entries, for: identifiers).map(\.title), ["Exact", "Child", "Sibling"])
+    }
+
     // MARK: - hostFromURLString
 
     func testHostFromFullURL() {

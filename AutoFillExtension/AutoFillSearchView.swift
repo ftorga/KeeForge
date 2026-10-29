@@ -63,7 +63,7 @@ struct AutoFillSearchView: View {
         return searchEntries.filter { entry in
             entry.title.lowercased().contains(query) ||
             entry.username.lowercased().contains(query) ||
-            entry.url.lowercased().contains(query) ||
+            CredentialMatcher.webURLs(of: entry).contains { $0.lowercased().contains(query) } ||
             entry.notes.lowercased().contains(query)
         }
     }
@@ -237,7 +237,7 @@ struct AutoFillSearchView: View {
         guard !searchText.isEmpty else { return possibleEntries }
         let query = searchText.lowercased()
         return possibleEntries.filter { entry in
-            entry.title.lowercased().contains(query) || entry.username.lowercased().contains(query) || entry.url.lowercased().contains(query) || entry.notes.lowercased().contains(query)
+            entry.title.lowercased().contains(query) || entry.username.lowercased().contains(query) || CredentialMatcher.webURLs(of: entry).contains { $0.lowercased().contains(query) } || entry.notes.lowercased().contains(query)
         }
     }
 
