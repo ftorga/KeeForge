@@ -506,7 +506,7 @@ enum CloudSyncCoordinator {
     static func discardConflictedPendingUploads(for reference: DatabaseReference) async -> Int {
         await Task.detached(priority: .utility) {
             let conflictedMarkers = PendingUploadQueue.listMarkers(for: reference.id)
-                .filter(\.marker.isConflicted)
+                .filter { $0.marker.isConflicted && $0.marker.confirmedAt == nil }
             guard conflictedMarkers.isEmpty == false else { return 0 }
 
             var discardedCount = 0
@@ -523,7 +523,8 @@ enum CloudSyncCoordinator {
                 do {
                     let directory = DatabaseListStore.databaseBackupDirectoryURL(for: reference)
                     let filename = String(pendingOverwriteBackupFilename(for: .now).dropLast(5)) + DatabaseListStore.retainedBackupSuffix + ".kdbx"
-                    try writeAtomicallyAndDurably(payload, to: directory.appendingPathComponent(filename))
+                    guard let anchor = AppGroupContainer.resolvedURL else { continue }
+                    try writeAtomicallyAndDurably(payload, to: directory.appendingPathComponent(filename), directoryAnchor: anchor)
                     let unresolved = marker.uploadAttemptID != nil && marker.confirmedAt == nil && marker.attemptIsFenced != true
                     if unresolved {
                         stored.marker.discardRequested = true

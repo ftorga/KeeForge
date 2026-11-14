@@ -89,3 +89,5 @@
 - `../../Views/Cloud/AGENTS.md`, `../../../KeeForgeMac/SECURITY.md`, `../../../docs/threat-model.md`
 
 - SDK transport tests use a real client with a unique intercepted host. Only read operations retry; write failure retains its actual journal attempt even when a response was lost or a conflict was returned.
+
+- A conflicted confirmed delivery remains owned by confirmation recovery; discard cannot retire it. Only verified local reconciliation may durably retire its journal and payload.

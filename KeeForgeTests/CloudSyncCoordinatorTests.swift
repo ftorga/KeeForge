@@ -615,17 +615,21 @@ final class CloudSyncCoordinatorTests: XCTestCase {
         XCTAssertEqual(transport.effects.uploads, [.init(bytes: context.payload, revision: "rev-before")])
     }
 
-    func testJournalDeliveryDoesNotRestoreRemovedDatabase() async throws {
+    func testJournalDeliveryRefusesRemovalUntilConfirmedOwnershipHasRetired() async throws {
         let context = try makeDeliveryContext()
-        let transport = CloudJournalTransport(beforeUpload: { DatabaseListStore.remove(id: context.reference.id) })
-        do {
-            _ = try await CloudDatabaseSaver.deliver(context.stored, reference: context.reference, environment: context.environment(transport: transport))
-            XCTFail("Removal revokes publication")
-        } catch { XCTAssertEqual(error as? SaveError, .saveContextUnavailable) }
+        let transport = CloudJournalTransport(beforeUpload: {
+            XCTAssertFalse(DatabaseListStore.remove(id: context.reference.id))
+            XCTAssertTrue(DatabaseListStore.databases.contains { $0.id == context.reference.id })
+            XCTAssertEqual(try PendingUploadQueue.readImmutablePayload(context.stored), context.payload)
+        })
+        guard case .saved? = try await CloudDatabaseSaver.deliver(context.stored, reference: context.reference,
+            environment: context.environment(transport: transport)) else { return XCTFail("Refused removal keeps the current request owned") }
+        XCTAssertTrue(try PendingUploadQueue.readJournal(for: context.reference.id).isEmpty)
+        XCTAssertEqual(try Data(contentsOf: context.cacheURL), context.payload)
+        XCTAssertTrue(DatabaseListStore.remove(id: context.reference.id))
         XCTAssertFalse(DatabaseListStore.databases.contains { $0.id == context.reference.id })
         XCTAssertFalse(FileManager.default.fileExists(atPath: context.cacheURL.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: try context.payloadURL.path))
-        XCTAssertTrue(try PendingUploadQueue.readJournal(for: context.reference.id).isEmpty)
         do {
             _ = try await CloudDatabaseSaver.deliver(context.stored, reference: context.reference,
                 environment: context.environment(transport: transport))
@@ -639,6 +643,34 @@ final class CloudSyncCoordinatorTests: XCTestCase {
         reference.updateCloudSyncMetadata { $0.remoteRev = revision }
         DatabaseListStore.update(reference)
         return try CloudJournalTestContext(reference: reference)
+    }
+
+    func testDiscardCannotRetireAConflictedConfirmedDeliveryBeforeLocalReconciliation() async throws {
+        let reference = makeCloudReference(remoteContentHash: nil, remoteModifiedAt: nil)
+        DatabaseListStore.update(reference)
+        let context = try CloudJournalTestContext(reference: reference)
+        let conflicted = try PendingUploadQueue.markConflicted(context.stored)
+        let transport = CloudJournalTransport()
+        var faulty = context.environment(transport: transport)
+        faulty.synchronizeCacheFile = { _ in throw CocoaError(.fileWriteUnknown) }
+        guard case .retained? = try await CloudDatabaseSaver.deliver(conflicted, reference: reference, environment: faulty) else {
+            return XCTFail("Accepted response with failed local publication must retain confirmation")
+        }
+        let confirmed = try XCTUnwrap(PendingUploadQueue.readJournal(for: reference.id).first)
+        XCTAssertNotNil(confirmed.marker.confirmedAt)
+        XCTAssertTrue(confirmed.marker.isConflicted)
+        let discarded = await CloudSyncCoordinator.discardConflictedPendingUploads(for: reference)
+        XCTAssertEqual(discarded, 0)
+        XCTAssertEqual(try PendingUploadQueue.readJournal(for: reference.id).map(\.id), [confirmed.id])
+        XCTAssertEqual(try PendingUploadQueue.readJournal(for: reference.id).first?.marker, confirmed.marker)
+        XCTAssertEqual(try PendingUploadQueue.readImmutablePayload(confirmed), context.payload)
+        XCTAssertThrowsError(try DatabaseListStore.withCloudKeyPublication(for: reference,
+            sha512: FileDigest.sha512(context.payload), permit: .init(actionID: UUID(), lockCycleID: 0)) { XCTFail("Confirmed recovery still owns publication") })
+        guard case .saved? = try CloudDatabaseSaver.recoverConfirmed(confirmed, reference: reference,
+            environment: context.environment(transport: transport)) else { return XCTFail("Recovery must finish locally") }
+        XCTAssertEqual(transport.effects.uploads.count, 1)
+        XCTAssertTrue(try PendingUploadQueue.readJournal(for: reference.id).isEmpty)
+        XCTAssertEqual(try Data(contentsOf: context.cacheURL), context.payload)
     }
 
     func testDiscardConflictedPendingUploadsBacksUpLivePayloadAndDropsOnlyConflictedMarkers() async throws {
@@ -671,13 +703,10 @@ final class CloudSyncCoordinatorTests: XCTestCase {
         )
     }
 
-    func testDiscardConflictedPendingUploadsWithoutLivePayloadDropsMarkerWithoutBackup() async throws {
-        // When the cache no longer hashes to the marker's recorded payload,
-        // those bytes are already gone (the overwrite path took its own
-        // backup); discarding just clears the marker.
+    func testDiscardConflictedPendingUploadsWithoutLivePayloadRetainsUnresolvedOwnership() async throws {
         let reference = makeCloudReference(remoteContentHash: nil, remoteModifiedAt: nil)
         try DatabaseListStore.cacheDatabaseCopy(Data("current-cache-bytes".utf8), for: reference)
-        _ = try PendingUploadQueue.enqueue(
+        let retained = try PendingUploadQueue.enqueue(
             makeMarker(
                 databaseId: reference.id,
                 openTimeSHA512: Data("vanished-payload-sha".utf8),
@@ -687,9 +716,9 @@ final class CloudSyncCoordinatorTests: XCTestCase {
 
         let discardedCount = await CloudSyncCoordinator.discardConflictedPendingUploads(for: reference)
 
-        XCTAssertEqual(discardedCount, 1)
+        XCTAssertEqual(discardedCount, 0)
         XCTAssertEqual(backupContents(for: reference), [])
-        XCTAssertTrue(PendingUploadQueue.listMarkers(for: reference.id).isEmpty)
+        XCTAssertEqual(PendingUploadQueue.listMarkers(for: reference.id).map(\.id), [retained.id])
     }
 
     private func makeMarker(
@@ -759,10 +788,12 @@ final class CloudSyncCoordinatorTests: XCTestCase {
             remoteModifiedAt: Date(timeIntervalSince1970: 100)
         )
         reference.cloudSyncPolicy = .manual
+        DatabaseListStore.update(reference)
         reference.updateCloudSyncMetadata { metadata in
             metadata.lastSyncedAt = lastSyncedAt
             metadata.lastSyncIssue = .networkUnavailable
         }
+        DatabaseListStore.update(reference)
         try DatabaseListStore.cacheDatabaseCopy(Data("cached-manual-copy".utf8), for: reference)
 
         let provider = MockCloudProvider()
@@ -793,6 +824,7 @@ final class CloudSyncCoordinatorTests: XCTestCase {
     func testManualPolicyStillDownloadsWhenNoCachedCopyExists() async throws {
         var reference = makeCloudReference(remoteContentHash: nil, remoteModifiedAt: nil)
         reference.cloudSyncPolicy = .manual
+        DatabaseListStore.update(reference)
         // Cloud caches are keyed by remote path, not reference id, so an
         // earlier test's copy would otherwise stand in.
         try? FileManager.default.removeItem(at: DatabaseListStore.cacheLocation(for: reference))
@@ -820,6 +852,7 @@ final class CloudSyncCoordinatorTests: XCTestCase {
             remoteModifiedAt: Date(timeIntervalSince1970: 100)
         )
         reference.cloudSyncPolicy = .manual
+        DatabaseListStore.update(reference)
         try DatabaseListStore.cacheDatabaseCopy(Data("cached-manual-copy".utf8), for: reference)
 
         let provider = MockCloudProvider()
@@ -847,6 +880,7 @@ final class CloudSyncCoordinatorTests: XCTestCase {
             remoteModifiedAt: Date(timeIntervalSince1970: 100)
         )
         reference.cloudSyncPolicy = .manual
+        DatabaseListStore.update(reference)
         try DatabaseListStore.cacheDatabaseCopy(Data("cached-manual-copy".utf8), for: reference)
 
         let provider = MockCloudProvider()
@@ -1140,7 +1174,7 @@ final class CloudSyncCoordinatorTests: XCTestCase {
         remoteContentHash: String?,
         remoteModifiedAt: Date?
     ) -> DatabaseReference {
-        DatabaseReference(
+        let reference = DatabaseReference(
             id: UUID(),
             nickname: nil,
             filename: "vault.kdbx",
@@ -1165,6 +1199,8 @@ final class CloudSyncCoordinatorTests: XCTestCase {
                 )
             )
         )
+        DatabaseListStore.update(reference)
+        return reference
     }
 }
 
