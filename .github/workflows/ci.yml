@@ -131,11 +131,15 @@ jobs:
             fi
           else
             selectors=(
-              DatabaseListStoreTests/testNoRenewResolutionKeepsRegistryCacheAndOwnerUntouchedForBrokenTrashAndMovedBookmarks
-              DatabaseViewModelTests/testRekeyDuringLocalReadPublicationDoesNotRestoreTheOldUnlockFactor
-              PendingLocalSaveTests/testMergeWhoseSaveConflictsKeepsThePendingSave
+              PendingLocalSaveTests/testAPendingSaveWithDivergedAttachmentsMovesToTheBackupsAndIsReported
+              PendingLocalSaveTests/testMovedMergeOwnBookmarkRefreshesTailCacheAfterDivergedBackup
+              PendingLocalSaveTests/testMergeTailCannotUseOwnBookmarkForChangedOrUnprovenAuthority
+              PendingLocalSaveTests/testOwnMergeTailReferenceCannotPublishAfterActualSettledRekey
+              PendingLocalSaveTests/testInstalledMergeBookmarkKeepsUnconfirmedOrChangedOwnershipSources
+              PendingLocalSaveTests/testMergeCompletionKeepsBookmarkScopeThroughSourceRetirementAndRealCacheRefresh
               PendingLocalSaveTests/testMovedPendingSourceDefersRenewalUntilMergeAndLeavesFutureSaveAndRekeyUsable
-              PendingLocalSaveTests/testRenewalDefersForRecordedAndFilesystemSourcesAndUnresolvedOwnership
+              PendingLocalSaveTests/testSourceArrivingAfterDurableRenewalMergesWithoutPublishingOldReadKeys
+              LocalDatabaseSaverTests/testInitialCacheReadCannotPublishAfterRemovalOrEpochSettlement
             )
           fi
           selection=()
