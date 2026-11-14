@@ -26,6 +26,64 @@ final class DatabaseViewModelCloudSyncTests: XCTestCase {
         try await super.tearDown()
     }
 
+    func testCloudReadPublicationDeadlineKeepsMainActorResponsiveAndNeverReopensClosedPermission() async throws {
+        let bytes = try KDBXTestFixture.test.data(in: Bundle(for: Self.self))
+        for claimFirst in [false, true] {
+            let reference = try makeStoredManualReference(fileID: "/Vaults/cloud-publication-\(claimFirst).kdbx", autoFillEnabled: false)
+            try DatabaseListStore.cacheDatabaseCopy(bytes, for: reference)
+            let entered = XCTestExpectation(description: "Cloud worker reached controlled boundary")
+            let workerEnded = XCTestExpectation(description: "Actual cloud publication worker ended")
+            let unlockEnded = XCTestExpectation(description: "Unlock returned after its publication deadline")
+            let heartbeat = XCTestExpectation(description: "Main actor heartbeat during blocked cloud IO")
+            let gate = CloudPublicationTestGate()
+            let effects = CloudJournalEffectCounter()
+            var io = DatabaseListStore.KeyCommitPublicationIO()
+            let liveCoordinate = io.coordinate
+            if !claimFirst {
+                io.coordinate = { target, registry, accessor in
+                    entered.fulfill()
+                    guard gate.wait() else { throw CocoaError(.fileReadUnknown) }
+                    try liveCoordinate(target, registry, accessor)
+                }
+            }
+            io.didFinish = { workerEnded.fulfill() }
+            let vm = DatabaseViewModel(databaseReference: reference,
+                cloudSyncOperation: { reference, _ in
+                    try await CloudSyncCoordinator.syncIfNeededForOpen(reference: reference, providerResolver: { _ in nil })
+                }, localReadPublicationIO: io, localReadPublicationTimeout: .milliseconds(100),
+                quickUnlockKeyPersistOperation: { _, _, _ in
+                    effects.record()
+                    if claimFirst { entered.fulfill(); return gate.wait() }
+                    return true
+                })
+            let opening = Task { await vm.unlock(password: KDBXTestFixture.test.password); unlockEnded.fulfill() }
+            let entry = await XCTWaiter.fulfillment(of: [entered], timeout: 60)
+            Task { @MainActor in heartbeat.fulfill() }
+            let deadline = await XCTWaiter.fulfillment(of: [unlockEnded, heartbeat], timeout: 5)
+            vm.lock()
+            XCTAssertEqual(vm.state, .locked)
+            XCTAssertNil(vm.compositeKey)
+            gate.release()
+            let joined = await XCTWaiter.fulfillment(of: [workerEnded], timeout: 15)
+            if joined != .completed {
+                XCTFail("Cloud publication worker failed to finish after releasing every test gate")
+                // Shared storage cannot be cleared beneath an unquiesced worker.
+                fatalError("Cloud publication test failed bounded worker termination")
+            }
+            if deadline != .completed {
+                let finalJoin = await XCTWaiter.fulfillment(of: [unlockEnded], timeout: 15)
+                if finalJoin != .completed { fatalError("Cloud unlock failed bounded termination after worker completion") }
+            }
+            await opening.value
+            XCTAssertEqual(entry, .completed)
+            XCTAssertEqual(deadline, .completed)
+            XCTAssertEqual(effects.value, claimFirst ? 1 : 0)
+            XCTAssertEqual(vm.state, .locked)
+            XCTAssertNil(vm.compositeKey)
+            XCTAssertEqual(try Data(contentsOf: DatabaseListStore.cacheLocation(for: reference)), bytes)
+        }
+    }
+
     func testValidCloudCacheUnlocksDuringUnavailableRecoveryButMutationAndKeyPublicationStayClosed() async throws {
         let bytes = try KDBXTestFixture.test.data(in: Bundle(for: Self.self))
         for fault in CloudJournalReadFault.allCases {
@@ -1309,4 +1367,10 @@ private final class PendingFlag: @unchecked Sendable {
         get { lock.withLock { storedValue } }
         set { lock.withLock { storedValue = newValue } }
     }
+}
+
+private final class CloudPublicationTestGate: @unchecked Sendable {
+    private let semaphore = DispatchSemaphore(value: 0)
+    func wait() -> Bool { semaphore.wait(timeout: .now() + 15) == .success }
+    func release() { semaphore.signal() }
 }
