@@ -1,0 +1,91 @@
+name: PR297 focused diagnostics
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Exact source commit SHA (diagnostic evidence only)
+        required: true
+        default: '480ba7cb6baf73788fc3892bbe8bc29aeb9f15a6'
+permissions:
+  contents: read
+jobs:
+  focused:
+    runs-on: macos-26
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - scheme: KeeForge
+            suite: KeeForgeTests
+            destination: 'platform=iOS Simulator,name=iPhone 17 Pro,OS=latest'
+          - scheme: KeeForgeMac
+            suite: KeeForgeMacTests
+            destination: 'platform=macOS'
+    env:
+      SCHEME: '${{ matrix.scheme }}'
+      TEST_SUITE: '${{ matrix.suite }}'
+      DESTINATION: '${{ matrix.destination }}'
+      SOURCE_SHA: '${{ inputs.source_ref }}'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: '${{ inputs.source_ref }}'
+      - name: Record exact diagnostic source
+        run: |
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          mkdir -p build
+          git show -s --format='%H%n%P%n%T' HEAD | tee build/source.txt
+      - name: Select Xcode
+        run: |
+          XCODE_PATH=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)
+          sudo xcode-select -s "$XCODE_PATH"
+          xcodebuild -version
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Prepare placeholder config
+        env:
+          DROPBOX_APP_KEY: ciplaceholderdropboxappkey
+        run: BOOTSTRAP_LOCAL_CONFIG_FROM_ENV=1 ./ci_scripts/prepare_build_config.sh .
+      - name: Generate project
+        run: xcodegen generate
+      - name: Execute exact failing selectors once
+        run: |
+          set -uo pipefail
+          selectors=(
+            DatabaseListStoreTests/testNoRenewResolutionKeepsRegistryCacheAndOwnerUntouchedForBrokenTrashAndMovedBookmarks
+            DatabaseViewModelTests/testRekeyDuringLocalReadPublicationDoesNotRestoreTheOldUnlockFactor
+            PendingLocalSaveTests/testMergeWhoseSaveConflictsKeepsThePendingSave
+            PendingLocalSaveTests/testMovedPendingSourceDefersRenewalUntilMergeAndLeavesFutureSaveAndRekeyUsable
+            PendingLocalSaveTests/testRenewalDefersForRecordedAndFilesystemSourcesAndUnresolvedOwnership
+          )
+          selection=()
+          for selector in "${selectors[@]}"; do
+            selection+=("-only-testing:$TEST_SUITE/$selector")
+          done
+          signing=()
+          if [[ "$TEST_SUITE" = KeeForgeMacTests ]]; then
+            signing=(CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY=- CODE_SIGN_ENTITLEMENTS= DEVELOPMENT_TEAM= PROVISIONING_PROFILE_SPECIFIER=)
+          fi
+          set +e
+          xcodebuild test -project KeeForge.xcodeproj -scheme "$SCHEME" \
+            -destination "$DESTINATION" -skipPackagePluginValidation \
+            "${selection[@]}" "${signing[@]}" \
+            -resultBundlePath build/focused.xcresult 2>&1 | tee build/focused.log
+          status=${PIPESTATUS[0]}
+          xcrun xcresulttool get test-results summary --path build/focused.xcresult --compact > build/summary.json
+          set -e
+          python3 ci_scripts/validate_xcresult_summary.py \
+            --result-bundle build/focused.xcresult --suite "$TEST_SUITE" --xcodebuild-exit "$status"
+      - name: Upload diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: 'focused-${{ matrix.suite }}'
+          path: |
+            build/*.txt
+            build/*.json
+            build/*.log
+            build/*.xcresult
+          retention-days: 7
