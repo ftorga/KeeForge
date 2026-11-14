@@ -242,6 +242,7 @@ final class DatabaseViewModel {
         let url: URL
         let data: Data
         var sourceIdentity: PendingLocalSaveStore.TargetIdentity? = nil
+        var bookmarkRenewal: DatabaseListStore.DatabaseBookmarkRenewal? = nil
     }
 
     struct ReloadedDatabase: Sendable {
@@ -447,13 +448,14 @@ final class DatabaseViewModel {
         _ reference: DatabaseReference,
         _ reason: String
     ) async throws -> QuickUnlockKeys
-    /// Returns whether the quick-unlock item now holds `keys.storedKey`.
+    /// Cloud persistence keeps its existing UI-actor boundary.
     typealias QuickUnlockKeyPersistOperation = @MainActor (
         _ keys: QuickUnlockKeys,
         _ reference: DatabaseReference,
         _ masterKeyEntered: Bool
     ) -> Bool
     /// Replaces the express-unlock item after a save; nil only drops it.
+    typealias LocalReadKeyPersistOperation = @Sendable (QuickUnlockKeys, DatabaseReference, Bool) -> Bool
     typealias ExpressUnlockKeySaveOperation = @Sendable (_ key: ExpressUnlockKey?, _ reference: DatabaseReference) -> Void
     typealias PendingUploadMarkerCheck = @Sendable (_ reference: DatabaseReference) -> Bool
     typealias StoredKeyPresenceCheck = @Sendable (_ reference: DatabaseReference) -> Bool
@@ -662,6 +664,8 @@ final class DatabaseViewModel {
     private let localSaveOperation: LocalSaveOperation
     private let pendingLocalStorageIO: PendingLocalSaveStore.StorageIO
     private let keyCommitPublicationIO: DatabaseListStore.KeyCommitPublicationIO
+    private let localReadPublicationIO: DatabaseListStore.KeyCommitPublicationIO
+    private let localReadPublicationTimeout: Duration
     private let keyCommitPublicationTimeout: Duration
     private var keyCommitPublicationActionID: UUID?
     private var keyCommitPublicationPermit: DatabaseListStore.KeyCommitPublicationPermit?
@@ -671,7 +675,9 @@ final class DatabaseViewModel {
     private let cloudConflictCopyOperation: CloudConflictCopyOperation
     private let reloadOperation: ReloadOperation
     private let biometricCompositeKeyOperation: BiometricCompositeKeyOperation
+    private let localPublicationFailure: @Sendable (String, Error) -> Void
     private let quickUnlockKeyPersistOperation: QuickUnlockKeyPersistOperation
+    private let localReadKeyPersistOperation: LocalReadKeyPersistOperation
     private let expressUnlockKeySaveOperation: ExpressUnlockKeySaveOperation
     private let pendingUploadMarkerCheck: PendingUploadMarkerCheck
     private let pendingUploadRecovery: PendingUploadRecovery.Environment
@@ -707,7 +713,10 @@ final class DatabaseViewModel {
         localDatabaseReadOperation: @escaping LocalDatabaseReadOperation = { reference in
             try await DatabaseViewModel.readLocalDatabase(reference: reference)
         },
+        localPublicationFailure: @escaping @Sendable (String, Error) -> Void = { _, _ in },
         pendingLocalStorageIO: PendingLocalSaveStore.StorageIO = .init(),
+        localReadPublicationIO: DatabaseListStore.KeyCommitPublicationIO = .init(),
+        localReadPublicationTimeout: Duration = .seconds(10),
         keyCommitPublicationIO: DatabaseListStore.KeyCommitPublicationIO = .init(),
         keyCommitPublicationTimeout: Duration = .seconds(10),
         localSaveOperation: @escaping LocalSaveOperation = { draft, reference, compositeKey, openTimeSHA512, reconciledRemoteSHA512, newCompositeKey, encryptionSettings in
@@ -769,6 +778,9 @@ final class DatabaseViewModel {
             )
             return try QuickUnlockKeychain.retrieve(for: reference, context: context)
         },
+        localReadKeyPersistOperation: @escaping LocalReadKeyPersistOperation = { keys, reference, entered in
+            QuickUnlockKeychain.persistKeychainItems(keys, for: reference, masterKeyEntered: entered) == .stored
+        },
         quickUnlockKeyPersistOperation: @escaping QuickUnlockKeyPersistOperation = { keys, reference, masterKeyEntered in
             return QuickUnlockKeychain.persistKeychainItems(keys, for: reference, masterKeyEntered: masterKeyEntered) == .stored
         },
@@ -811,9 +823,12 @@ final class DatabaseViewModel {
         self.cloudSyncOperation = cloudSyncOperation
         self.cloudRefreshOperation = cloudRefreshOperation
         self.localDatabaseReadOperation = localDatabaseReadOperation
+        self.localPublicationFailure = localPublicationFailure
         self.localSaveOperation = localSaveOperation
         self.pendingLocalStorageIO = pendingLocalStorageIO
         self.keyCommitPublicationIO = keyCommitPublicationIO
+        self.localReadPublicationIO = localReadPublicationIO
+        self.localReadPublicationTimeout = localReadPublicationTimeout
         self.keyCommitPublicationTimeout = keyCommitPublicationTimeout
         self.cloudSaveOperation = cloudSaveOperation
         self.conflictCopyEncryptionOperation = conflictCopyEncryptionOperation
@@ -822,6 +837,7 @@ final class DatabaseViewModel {
         self.reloadOperation = reloadOperation
         self.biometricCompositeKeyOperation = biometricCompositeKeyOperation
         self.quickUnlockKeyPersistOperation = quickUnlockKeyPersistOperation
+        self.localReadKeyPersistOperation = localReadKeyPersistOperation
         self.expressUnlockKeySaveOperation = expressUnlockKeySaveOperation
         self.pendingUploadMarkerCheck = pendingUploadMarkerCheck
         self.pendingUploadRecovery = pendingUploadRecovery
@@ -843,12 +859,6 @@ final class DatabaseViewModel {
             reconciledRemoteSHA512: reconciled, kdfPolicy: .mainApp, newCompositeKey: newKey, encryptionSettings: settings)
     }) {
         self.init(databaseReference: createdDatabase.reference, localSaveOperation: localSaveOperation)
-        let localRead: PendingLocalSaveStore.ReadKeyPublication?
-        if !createdDatabase.reference.isCloudBacked,
-           let lease = try? PendingLocalSaveStore.captureCacheReadLease(for: createdDatabase.reference),
-           let target = try? LocalDatabaseSaver.captureTarget(for: createdDatabase.reference) {
-            localRead = .init(lease: lease, target: target, sha512: createdDatabase.openTimeSHA512, sharedCopy: false)
-        } else { localRead = nil }
         finalizeSuccessfulUnlock(
             payload: UnlockPayload(
                 rootGroup: createdDatabase.rootGroup,
@@ -862,7 +872,7 @@ final class DatabaseViewModel {
             quickLaunchKey: createdDatabase.compositeKey,
             usesHardwareKey: false,
             sessionKey: createdDatabase.sessionKey,
-            masterKeyEntered: true, localRead: localRead
+            masterKeyEntered: true
         )
     }
 
@@ -1200,6 +1210,12 @@ final class DatabaseViewModel {
             )
 
             guard finishUnlockAttempt(attempt) else { return }
+            let readCycle = lockCycleID
+            sessionKeyFileData = keyFileData
+            if !databaseReference.isCloudBacked {
+                keyCommitPublicationPermit?.close()
+                keyCommitPublicationActionID = attempt
+            }
             finalizeSuccessfulUnlock(
                 payload: unlockPayload,
                 compositeKey: compositeKey,
@@ -1208,8 +1224,12 @@ final class DatabaseViewModel {
                 sessionKey: sessionKey,
                 masterKeyEntered: true, localRead: readResult.readProof
             )
-            sessionKeyFileData = keyFileData
-            await mergePendingLocalSaves()
+            let completed = await publishLocalReadKeys(readResult.readProof,
+                keys: QuickUnlockKeys(storedKey: quickLaunchKey, expressKey: hardwareKey == nil ? unlockPayload.expressKey : nil),
+                masterKeyEntered: true, actionID: attempt, expectedCycle: readCycle)
+            guard readCycle == lockCycleID, case .unlocked = state,
+                  databaseReference.isCloudBacked || keyCommitPublicationActionID == attempt else { return }
+            if completed { await mergePendingLocalSaves() }
         } catch {
             guard finishUnlockAttempt(attempt) else { return }
             let diagnostics = makeUnlockDiagnostics(
@@ -1290,6 +1310,11 @@ final class DatabaseViewModel {
             // A superseded attempt unlocked nothing; the lock that ended it
             // owns the screen.
             guard finishUnlockAttempt(attempt) else { return .failed }
+            let readCycle = lockCycleID
+            if !databaseReference.isCloudBacked {
+                keyCommitPublicationPermit?.close()
+                keyCommitPublicationActionID = attempt
+            }
             finalizeSuccessfulUnlock(
                 payload: unlockPayload,
                 compositeKey: compositeKey,
@@ -1298,7 +1323,12 @@ final class DatabaseViewModel {
                 sessionKey: sessionKey,
                 masterKeyEntered: false, localRead: readResult.readProof
             )
-            await mergePendingLocalSaves()
+            let completed = await publishLocalReadKeys(readResult.readProof,
+                keys: QuickUnlockKeys(storedKey: storedKey, expressKey: hardwareKey == nil ? unlockPayload.expressKey : nil),
+                masterKeyEntered: false, actionID: attempt, expectedCycle: readCycle)
+            guard readCycle == lockCycleID, case .unlocked = state,
+                  databaseReference.isCloudBacked || keyCommitPublicationActionID == attempt else { return .failed }
+            if completed { await mergePendingLocalSaves() }
             return .unlocked
         } catch {
             guard finishUnlockAttempt(attempt) else { return .failed }
@@ -1895,6 +1925,35 @@ final class DatabaseViewModel {
             return groupIndex[id] != nil && id != currentRootGroup?.recycleBinUUID
                 && isGroupInRecycleBin(groupID: id) && !isGroupProtectedFromDeletion(groupID: id)
         }
+    }
+
+    /// Where an item lying directly in the recycle bin came from and when it
+    /// was put there. Nil for anything else: inside a recycled group,
+    /// `LocationChanged` dates the item's last move, not its deletion. The
+    /// date also needs `PreviousParentGroup`: versions before 1.15 recycled
+    /// without stamping either, leaving an older move's `LocationChanged`.
+    func recycleBinOrigin(for item: RecycleBinItem) -> RecycleBinOrigin? {
+        _ = contentRevision
+        guard let bin = recycleBinGroup else { return nil }
+        let xml: OpaqueXMLNodes
+        let deletedAt: Date?
+        switch item {
+        case .entry(let id):
+            guard let entry = bin.entries.first(where: { $0.id == id }) else { return nil }
+            xml = entry.unknownXML
+            deletedAt = entry.locationChanged
+        case .group(let id):
+            guard let group = bin.groups.first(where: { $0.id == id }) else { return nil }
+            xml = group.unknownXML
+            deletedAt = group.locationChanged
+        }
+        guard let parentID = PreviousParentGroupXML.parentID(in: xml) else { return nil }
+        var groupName: String?
+        if let parent = groupIndex[parentID], parentID != bin.id, isGroupInRecycleBin(groupID: parentID) == false {
+            groupName = parentID == visibleRootGroupID ? databaseDisplayName : parent.name
+        }
+        guard groupName != nil || deletedAt != nil else { return nil }
+        return RecycleBinOrigin(groupName: groupName, deletedAt: deletedAt)
     }
 
     func restoreDestinationOptions(for item: RecycleBinItem) -> [MoveDestinationOption] {
@@ -2768,6 +2827,7 @@ final class DatabaseViewModel {
             filename: newKeyFileFilename, changedAt: nowProvider())
 
         let actionID = UUID()
+        keyCommitPublicationPermit?.close()
         keyCommitPublicationActionID = actionID
         isSaving = true
         saveError = nil
@@ -2782,6 +2842,7 @@ final class DatabaseViewModel {
 
         try await refreshSameEpochKeyFilePreference()
         let cloudKeyChange = PendingUploadQueue.KeyChange(keyFileBookmarkData: newKeyFileBookmarkData, keyFileFilename: newKeyFileFilename)
+        let legacyCleanupReference = databaseReference
         let saveResult: SaveResult
         do {
             switch databaseReference.source {
@@ -2818,6 +2879,22 @@ final class DatabaseViewModel {
         switch saveResult {
         case .saved(let newSHA512, _, let localCommit),
              .committedWithoutConfirmedDurability(let newSHA512, _, let localCommit, _):
+            // Preserve this session's known ciphertext even when registry publication is unavailable.
+            if !databaseReference.isCloudBacked, let localCommit,
+               localCommit.databaseID == databaseReference.id, localCommit.sha512 == newSHA512,
+               localCommit.encryptedSnapshot != nil,
+               case .masterKeyChange(let installedAssociation?) = localCommit.purpose,
+               installedAssociation == association, expectedLockCycleID == lockCycleID,
+               keyCommitPublicationActionID == actionID, case .unlocked = state {
+                rememberCommittedCiphertext(localCommit)
+                self.compositeKey = newCompositeKey
+                sessionKeyFileData = newKeyFileData
+                self.openTimeSHA512 = newSHA512
+                databaseReference.keyFileBookmarkData = installedAssociation.bookmarkData
+                databaseReference.keyFileFilename = installedAssociation.filename
+                databaseReference.lastMasterKeyChangeAt = installedAssociation.changedAt
+                quickUnlockItemHoldsSessionKey = false
+            }
             // Keychain and reference reflect the on-disk file, so they update
             // even if the session locked mid-flight; the in-memory secrets must
             // not resurrect behind the lock screen. The express item belonged
@@ -2842,13 +2919,16 @@ final class DatabaseViewModel {
                 do {
                     publication = try await publishLocalKeyCommit(reference: expected, receipt: localCommit, actionID: actionID,
                         cleanup: { result in
-                            if result.hadStoredKey { _ = DatabaseListStore.clearLegacyKeychainFilename(for: expected) }
+                            if result.hadStoredKey { _ = DatabaseListStore.clearLegacyKeychainFilename(for: legacyCleanupReference) }
                         }) {
                             saveExpressKey(nil, expected)
                             return Self.refreshStoredCompositeKeyItemsAfterRekey(newCompositeKey, reference: expected,
                                 hasStoredKey: hasStoredKey, storeKey: storeKey, deleteKey: deleteKey)
                         }
-                } catch { throw SaveAssociationWarning(reason: .authorityChanged) }
+                } catch {
+                    localPublicationFailure("rekey-key-publication", error)
+                    throw SaveAssociationWarning(reason: .authorityChanged)
+                }
                 storedNewKey = publication.stored
             }
             let associationSaved: Bool
@@ -2871,7 +2951,10 @@ final class DatabaseViewModel {
                 let current = refreshed ?? ref
                 do {
                     _ = try await publishLocalKeyCommit(reference: current, receipt: localCommit, actionID: actionID) { true }
-                } catch { throw SaveAssociationWarning(reason: .authorityChanged) }
+                } catch {
+                    localPublicationFailure("rekey-post-association-authority", error)
+                    throw SaveAssociationWarning(reason: .authorityChanged)
+                }
                 databaseReference = current
                 databaseReference.keyFileBookmarkData = association.bookmarkData
                 databaseReference.keyFileFilename = association.filename
@@ -2923,7 +3006,7 @@ final class DatabaseViewModel {
         defer { if keyCommitPublicationPermit === permit { keyCommitPublicationPermit = nil } }
         let io = keyCommitPublicationIO
         let result = try await CoordinatedFileReader.performBlocking(timeout: keyCommitPublicationTimeout, onInterruption: { permit.close() }) {
-            defer { io.didFinish() }
+            defer { io.didFinish(); permit.finishWorker() }
             let result = try DatabaseListStore.withLocalKeyCommitPublication(for: reference, receipt: receipt, permit: permit, io: io, effect)
             cleanup(result)
             return result
@@ -3132,6 +3215,21 @@ final class DatabaseViewModel {
         }
     }
 
+    nonisolated static func verifyRecoveryExport(_ bytes: Data, draft: DatabaseDraft, compositeKey: SymmetricKey) throws {
+        guard let expectedPool = draft.binaryPoolFields else { throw SaveError.saveContextUnavailable }
+        let opened = try KDBXParser.parse(data: bytes, compositeKey: compositeKey,
+            sessionKey: draft.writerSessionKey, kdfPolicy: .mainApp)
+        let expected = try KDBXWriter.document(rootGroup: draft.rootGroup, meta: draft.meta, sessionKey: draft.writerSessionKey)
+        let actual = try KDBXWriter.document(rootGroup: opened.rootGroup, meta: opened.meta, sessionKey: draft.writerSessionKey)
+        // Compare the representable XML, including the writer's timestamp precision.
+        let comparisonKey = try SecureRandom.data(count: 64)
+        let expectedXML = try expected.serialized(innerStream: .chaCha20, innerStreamKey: comparisonKey)
+        let actualXML = try actual.serialized(innerStream: .chaCha20, innerStreamKey: comparisonKey)
+        guard expectedXML == actualXML, expectedPool == opened.header.innerHeaderBinaryFields else {
+            throw SaveError.reencryptionVerificationFailed
+        }
+    }
+
     func makeLocalRecoveryExport() async throws -> DatabaseExportService.ExportPayload {
         guard !isReadOnly else { throw SaveError.databaseIsReadOnly }
         guard !databaseReference.isCloudBacked, case .unlocked = state,
@@ -3144,14 +3242,7 @@ final class DatabaseViewModel {
             guard !Task.isCancelled, cycle == lockCycleID, revision == contentRevision, case .unlocked = state else { throw SaveError.saveContextUnavailable }
             let bytes = try await encrypt(draft, compositeKey, source)
             try await Task.detached {
-                guard let expectedPool = draft.binaryPoolFields else { throw SaveError.saveContextUnavailable }
-                let opened = try KDBXParser.parse(data: bytes, compositeKey: compositeKey,
-                    sessionKey: draft.writerSessionKey, kdfPolicy: .mainApp)
-                let expected = try KDBXWriter.document(rootGroup: draft.rootGroup, meta: draft.meta, sessionKey: draft.writerSessionKey)
-                let actual = try KDBXWriter.document(rootGroup: opened.rootGroup, meta: opened.meta, sessionKey: draft.writerSessionKey)
-                guard expected == actual, expectedPool == opened.header.innerHeaderBinaryFields else {
-                    throw SaveError.reencryptionVerificationFailed
-                }
+                try Self.verifyRecoveryExport(bytes, draft: draft, compositeKey: compositeKey)
             }.value
             guard !Task.isCancelled, cycle == lockCycleID, revision == contentRevision, case .unlocked = state else { throw SaveError.saveContextUnavailable }
             let copyName = DatabaseExportService.currentCopyFilename(for: reference, date: conflictCopyDateProvider(), timeZone: .current)
@@ -3505,8 +3596,10 @@ final class DatabaseViewModel {
         let pendingSaves: [PendingLocalSaveStore.PendingSave]
         do {
             let loaded = try await Task.detached(priority: .userInitiated) {
-                let recovery = try PendingLocalSaveStore.recovery(for: reference.id)
-                return (recovery, recovery.needsRecovery ? [] : PendingLocalSaveStore.saves(for: reference.id))
+                try DatabaseListStore.withLocalCacheReference(reference, allowNewReference: false) {
+                    let recovery = try PendingLocalSaveStore.recovery(for: reference.id)
+                    return (recovery, recovery.needsRecovery ? [] : PendingLocalSaveStore.saves(for: reference.id))
+                }
             }.value
             guard expectedLockCycleID == lockCycleID, databaseReference == reference,
                   self.compositeKey == compositeKey, self.sessionKey == sessionKey, self.openTimeSHA512 == openTimeSHA512,
@@ -3517,6 +3610,7 @@ final class DatabaseViewModel {
             }
             pendingSaves = loaded.1
         } catch {
+            localPublicationFailure("merge-owner-load", error)
             if expectedLockCycleID == lockCycleID { pendingUploadMergeFailure = .localSourceRecovery }
             return .settledOrDeferred
         }
@@ -3572,13 +3666,16 @@ final class DatabaseViewModel {
             let storageIO = pendingLocalStorageIO
             let receipts = mergedReceipts
             let token: PendingLocalSaveStore.Token
+            var admissionPhase = "merge-target-capture"
             do {
                 let target = try await Task.detached { try LocalDatabaseSaver.captureTarget(for: reference) }.value
+                admissionPhase = "merge-admission"
                 token = try await Task.detached {
                     try PendingLocalSaveStore.admit(receipts, for: reference.id, target: target,
                         baseline: openTimeSHA512, masterKeyChangedAt: reference.lastMasterKeyChangeAt, io: storageIO)
                 }.value
             } catch {
+                localPublicationFailure(admissionPhase, error)
                 if expectedLockCycleID == lockCycleID { pendingUploadMergeFailure = .localSourceRecovery }
                 return .settledOrDeferred
             }
@@ -3651,14 +3748,21 @@ final class DatabaseViewModel {
         // The unlock and the saver left the shared copy alone while saves were
         // pending. Bring it up to the file, unless another AutoFill save has
         // arrived in the meantime.
+        let failure = localPublicationFailure
         await Task.detached(priority: .userInitiated) {
-            guard PendingLocalSaveStore.hasSaves(for: reference.id) == false,
-                  let lease = try? PendingLocalSaveStore.captureCacheReadLease(for: reference),
-                  let url = DatabaseListStore.resolveDatabaseURL(for: reference),
-                  let data = try? Self.readSecurityScopedData(from: url) else {
-                return
-            }
-            try? LocalDatabaseSaver.cacheLocalSnapshot(data, for: reference, lease: lease)
+            guard PendingLocalSaveStore.hasSaves(for: reference.id) == false else { return }
+            var stage = "lease"
+            do {
+                let lease = try PendingLocalSaveStore.captureCacheReadLease(for: reference)
+                stage = "location"
+                guard let url = DatabaseListStore.resolveDatabaseURL(for: reference, renewBookmark: false) else { throw SaveError.databaseLocationUnavailable }
+                stage = "read"
+                let data = try Self.readSecurityScopedData(from: url)
+                let renewed = lease.bookmarkRenewal != nil
+                try LocalDatabaseSaver.cacheLocalSnapshot(data, for: reference, lease: lease, onFailure: { phase, _ in
+                    stage = "cache-" + phase.rawValue + (renewed ? "-renewed" : "-original")
+                })
+            } catch { failure("merge-tail-" + stage, error) }
         }.value
         return .settledOrDeferred
     }
@@ -4257,8 +4361,8 @@ final class DatabaseViewModel {
                         }
                     }
                 } else {
-                    guard let url = DatabaseListStore.resolveDatabaseURL(for: databaseReference) else { return }
                     let lease = try PendingLocalSaveStore.captureCacheReadLease(for: databaseReference)
+                    guard let url = DatabaseListStore.resolveDatabaseURL(for: databaseReference, renewBookmark: false) else { return }
                     data = try Self.readSecurityScopedData(from: url)
                     guard PendingLocalSaveStore.permitsPublishingReadCopy(sha512: FileDigest.sha512(data), for: databaseReference.id) else { return }
                     try LocalDatabaseSaver.cacheLocalSnapshot(data, for: databaseReference, lease: lease)
@@ -4738,20 +4842,85 @@ final class DatabaseViewModel {
             mayPublish = stored != nil
             storedQuickUnlockKey = stored == true
             if storedQuickUnlockKey { DatabaseListStore.clearLegacyKeychainFilename(for: databaseReference) }
-        } else if let localRead {
-            let stored = try? DatabaseListStore.withLocalReadKeyPublication(for: databaseReference, read: localRead) {
-                quickUnlockKeyPersistOperation(keys, databaseReference, masterKeyEntered)
-            }
-            mayPublish = stored != nil
-            storedQuickUnlockKey = stored == true
-            if storedQuickUnlockKey { DatabaseListStore.clearLegacyKeychainFilename(for: databaseReference) }
         } else { mayPublish = false; storedQuickUnlockKey = false }
         quickUnlockItemHoldsSessionKey = storedQuickUnlockKey && usesHardwareKey == false
-        DatabaseListStore.markDatabaseOpened(id: databaseReference.id)
-        refreshDatabaseReference()
-        if mayPublish { populateCredentialStoreIfNeeded(root: payload.rootGroup) }
+        if databaseReference.isCloudBacked || localRead == nil {
+            DatabaseListStore.markDatabaseOpened(id: databaseReference.id)
+            refreshDatabaseReference()
+            if databaseReference.isCloudBacked { populateCredentialStoreIfNeeded(root: payload.rootGroup) }
+        }
         refreshPendingUploadConflict()
         ReviewPromptService.noteSuccessfulUnlock(followsError: followsFailedAttempt)
+    }
+
+    private func publishLocalReadKeys(
+        _ read: PendingLocalSaveStore.ReadKeyPublication?, keys: QuickUnlockKeys,
+        masterKeyEntered: Bool, actionID: UUID, expectedCycle: Int
+    ) async -> Bool {
+        guard !databaseReference.isCloudBacked, let read else { return true }
+        guard expectedCycle == lockCycleID, keyCommitPublicationActionID == actionID,
+              case .unlocked = state else { return false }
+        let reference = databaseReference
+        keyCommitPublicationPermit?.close()
+        let permit = DatabaseListStore.KeyCommitPublicationPermit(actionID: actionID, lockCycleID: expectedCycle)
+        keyCommitPublicationPermit = permit
+        defer { if keyCommitPublicationPermit === permit { keyCommitPublicationPermit = nil } }
+        let effect = localReadKeyPersistOperation
+        let io = localReadPublicationIO
+        var stored = false
+        do {
+            stored = try await CoordinatedFileReader.performBlocking(timeout: localReadPublicationTimeout,
+                onInterruption: { permit.close() }) {
+                defer { io.didFinish(); permit.finishWorker() }
+                let stored = try DatabaseListStore.withLocalReadKeyPublication(for: reference, read: read, permit: permit, io: io) {
+                    effect(keys, reference, masterKeyEntered)
+                }
+                if stored { _ = DatabaseListStore.clearLegacyKeychainFilename(for: read.lease.bookmarkRenewal?.after ?? reference) }
+                return stored
+            }
+        } catch {
+            let interrupted = error is CoordinatedFileReader.TimeoutError || error is CancellationError
+            localPublicationFailure(permit.state == .claimed ? "read-key-unconfirmed" : interrupted ? "read-key-interrupted" : "read-key", error)
+            guard !interrupted, permit.state != .claimed, expectedCycle == lockCycleID,
+                  keyCommitPublicationActionID == actionID, state == .unlocked else {
+                if read.lease.bookmarkRenewal != nil, expectedCycle == lockCycleID,
+                   keyCommitPublicationActionID == actionID, state == .unlocked {
+                    pendingUploadMergeFailure = .localSourceRecovery
+                }
+                return false
+            }
+            if read.lease.bookmarkRenewal != nil {
+                do {
+                    let renewal = try await CoordinatedFileReader.performBlocking(timeout: localReadPublicationTimeout) {
+                        try DatabaseListStore.authenticatedBookmarkRenewalForMerge(for: reference, read: read, io: io)
+                    }
+                    guard expectedCycle == lockCycleID, keyCommitPublicationActionID == actionID,
+                          databaseReference == reference, case .unlocked = state else { return false }
+                    databaseReference.bookmarkData = renewal.after.bookmarkData
+                } catch {
+                    localPublicationFailure("read-bookmark-for-merge", error)
+                    if expectedCycle == lockCycleID, keyCommitPublicationActionID == actionID, state == .unlocked {
+                        pendingUploadMergeFailure = .localSourceRecovery
+                    }
+                    return false
+                }
+            }
+            return true
+        }
+        guard expectedCycle == lockCycleID, keyCommitPublicationActionID == actionID,
+              databaseReference == reference, case .unlocked = state else { return false }
+        if let renewal = read.lease.bookmarkRenewal, reference == renewal.before {
+            databaseReference.bookmarkData = renewal.after.bookmarkData
+        }
+        quickUnlockItemHoldsSessionKey = stored && !sessionUsesHardwareKey
+        DatabaseListStore.markDatabaseOpened(id: reference.id)
+        if let current = DatabaseListStore.databases.first(where: { $0.id == reference.id }),
+           PendingLocalSaveStore.PreferenceObservation(databaseReference).matches(current),
+           databaseReference.hardwareKey == current.hardwareKey {
+            databaseReference = current
+        }
+        if let rootGroup { populateCredentialStoreIfNeeded(root: rootGroup) }
+        return true
     }
 
     private func hardwareKeyCompositeKey(
@@ -4835,7 +5004,10 @@ final class DatabaseViewModel {
         guard !databaseReference.isCloudBacked else { return }
         let cycle = lockCycleID
         let reference = databaseReference
-        let preference = try await Task.detached { try DatabaseListStore.currentSameEpochPreference(for: reference) }.value
+        let failure = localPublicationFailure
+        let preference = try await Task.detached {
+            try DatabaseListStore.currentSameEpochPreference(for: reference, onFailure: failure)
+        }.value
         guard cycle == lockCycleID, case .unlocked = state,
               databaseReference.lastMasterKeyChangeAt == reference.lastMasterKeyChangeAt else { throw CancellationError() }
         databaseReference.keyFileBookmarkData = preference.bookmarkData
@@ -4860,7 +5032,7 @@ final class DatabaseViewModel {
             )
         }
 
-        guard let url = DatabaseListStore.resolveDatabaseURL(for: reference) else {
+        guard let url = DatabaseListStore.resolveDatabaseURL(for: reference, renewBookmark: false) else {
             throw SaveError.databaseLocationUnavailable
         }
 
@@ -4980,21 +5152,26 @@ final class DatabaseViewModel {
         unlockStatusMessage = Self.decryptingStatusMessage
 
         let reference = databaseReference
-        let lease = await Task.detached { try? PendingLocalSaveStore.captureCacheReadLease(for: reference) }.value
+        var lease = await Task.detached { try? PendingLocalSaveStore.captureCacheReadLease(for: reference) }.value
         let result = try await localDatabaseReadOperation(reference)
+        lease?.bookmarkRenewal = result.bookmarkRenewal
         let proof: PendingLocalSaveStore.ReadKeyPublication?
         if let lease, let target = result.sourceIdentity {
             let sha = await Task.detached { FileDigest.sha512(result.data) }.value
-            proof = .init(lease: lease, target: target, sha512: sha, sharedCopy: reference.bookmarkData == nil)
+            proof = .init(lease: lease, target: target, sha512: sha, sharedCopy: reference.bookmarkData == nil, encryptedSnapshot: result.data)
         } else { proof = nil }
         return (result.url, result.data, nil, lease, proof)
     }
 
-    nonisolated private static func readLocalDatabase(
-        reference: DatabaseReference
+    nonisolated static func readLocalDatabase(
+        reference: DatabaseReference,
+        resolveBookmark: @escaping @Sendable (Data) -> (url: URL, isStale: Bool)? = SecurityScopedBookmarkManager.resolveURL,
+        bookmarkRenewalIO: DurableFileWriteIO = .init()
     ) async throws -> LocalDatabaseReadResult {
         try await CoordinatedFileReader.performBlocking(timeout: localDatabaseReadTimeout) {
-            guard let location = DatabaseListStore.locateDatabaseFile(for: reference) else {
+            var renewal: DatabaseListStore.DatabaseBookmarkRenewal?
+            guard let location = DatabaseListStore.locateDatabaseFile(for: reference, resolveBookmark: resolveBookmark,
+                bookmarkRenewalIO: bookmarkRenewalIO, onBookmarkRenewal: { renewal = $0 }) else {
                 throw CocoaError(.fileReadNoSuchFile)
             }
             guard case .available(let url) = location else {
@@ -5012,7 +5189,7 @@ final class DatabaseViewModel {
             var result: Result<LocalDatabaseReadResult, Error>?
             NSFileCoordinator().coordinate(readingItemAt: url, options: [], error: &error) { source in
                 result = Result { LocalDatabaseReadResult(url: source, data: try Data(contentsOf: source),
-                    sourceIdentity: try PendingLocalSaveStore.targetIdentity(at: source)) }
+                    sourceIdentity: try PendingLocalSaveStore.targetIdentity(at: source), bookmarkRenewal: renewal) }
             }
             if let error { throw error }
             guard let result else { throw CocoaError(.fileReadUnknown) }
@@ -5054,7 +5231,11 @@ final class DatabaseViewModel {
     private func cacheDatabaseCopyForLocalDatabase(_ data: Data, lease: PendingLocalSaveStore.CacheReadLease?) async {
         guard !databaseReference.isCloudBacked, let lease else { return }
         let reference = databaseReference
-        await Task.detached { try? LocalDatabaseSaver.cacheLocalSnapshot(data, for: reference, lease: lease) }.value
+        let failure = localPublicationFailure
+        await Task.detached {
+            try? LocalDatabaseSaver.cacheLocalSnapshot(data, for: reference, lease: lease,
+                onFailure: { stage, error in failure("read-cache-" + stage.rawValue, error) })
+        }.value
     }
 
     private func refreshCredentialStoreIfStillUnlocked(with root: KPGroup, expectedLockCycleID: Int) {
@@ -5234,7 +5415,7 @@ final class DatabaseViewModel {
         return siblingPath.hasPrefix("/") ? siblingPath : "/\(siblingPath)"
     }
 
-    private static func reloadDatabase(
+    static func reloadDatabase(
         reference: DatabaseReference,
         compositeKey: SymmetricKey
     ) async throws -> ReloadedDatabase {
@@ -5254,7 +5435,7 @@ final class DatabaseViewModel {
             updatedReference = resolution.reference
             cloudSyncStatus = resolution.status
         } else {
-            guard let location = DatabaseListStore.locateDatabaseFile(for: reference) else {
+            guard let location = DatabaseListStore.locateDatabaseFile(for: reference, renewBookmark: false) else {
                 throw SaveError.databaseLocationUnavailable
             }
             guard case .available(let url) = location else {

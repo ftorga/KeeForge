@@ -374,3 +374,75 @@ policy, and interval selection remains the separate shared setting. This is not
 cross-process atomicity: app and extensions have distinct mutexes, and the current
 UserDefaults dictionary can still lose simultaneous updates across processes.
 No cross-store Keychain/date transaction or durability/power-loss proof is added.
+
+## Bookmark renewal during a local read
+
+A supported stale-bookmark renewal changes only that field through its existing CAS. Successful durable publication can return an in-memory receipt binding the exact before/after references, captured owner epoch and coordinated target identity. No failed, visible-unconfirmed, contended or revoked publication mints a receipt. It is not persisted and contains no secret material. A reader may carry it to cache or key publication only while the actual registry equals that exact after-reference and the original epoch, factors, hardware, source/admission and revocation checks still pass. A final read-key effect additionally holds coordination over the authenticated ciphertext and registry through immediate try-list, owner validation and keychain-only publication. Changed inode or ciphertext rejects the effect. Local writes and their output-cache publication resolve without renewing bookmarks, preserving their own commit and epoch boundaries.
+
+Provider resolution/coordination and ciphertext IO occur in the existing bounded worker outside list lock. Lock, cancellation and a superseding read close pending permission. If Keychain IO already claimed permission, timeout reports uncertainty and cannot revoke its possible effects or restore session secrets later. Memory lock/AutoFill cleanup remain independent of that worker; a claimed Keychain call can still delay other registry-dependent work. AutoFill can fill authenticated credentials after rejected or uncertain key persistence, with registry-dependent switch/mutation actions withheld for the uncertain request. A created local session retains its authenticated RAM ciphertext and draft-export capability without invoking the cloud persistence callback as a substitute for local read authority.
+
+A known write publishes or invalidates its output cache against the installed target identity and ciphertext in its existing commit receipt. It does not select a different source by resolving the pre-replacement bookmark again. The current registry observation, owner epoch, pending-source barriers and exact target/ciphertext checks remain mandatory; an unknown write supplies no installed receipt.
+
+Unlock installs the session key-file factor with its unlocked payload before awaiting
+read-key persistence. Post-await work still requires that original action UUID:
+a same-session rekey can supersede the unlock without changing the lock cycle.
+AutoFill distinguishes observed worker termination without a claim from pending
+timeout and claimed uncertainty. Only the first releases its matching live-request
+latch after a terminal rejection; cancellation or revocation does not reopen it.
+
+A known commit receipt binds bytes and target identity, not sandbox authority.
+Pending-merge completion keeps the resolved bookmark grant open through source
+retirement, cache refresh and stale-cache invalidation, without renewing it during
+the transition. The original-file coordination is released before cache publication
+takes registry authority. Injected scope-lifetime observations exercise this order
+with real storage; signed external-file sandbox grants remain device validation.
+
+During an ordinary save, completion observes the already granted resolved location
+of that same operation rather than choosing another location through a new bookmark
+resolution. Pending-merge follow-up reads and cache/fingerprint/reload auxiliaries resolve
+without renewal or Documents heal, so they cannot invalidate their own captured
+reference; all source, epoch, target and reference guards still apply. Read-only replacement errors after entry can remain indeterminate with intact
+observable bytes and a retained admission: permission error types alone are not
+affirmative proof that replacement never happened, and a retry cannot encrypt again.
+
+Known rekey factors may reach the originating session before registry publication.
+Legacy metadata cleanup still compares its captured pre-save registry observation
+after the authorized Keychain effect, never the already updated RAM factors/date.
+The comparison may fail honestly after a concurrent change; it does not adopt that
+change or remove a newer alias.
+
+No-renew resolution performs no ownership capture or persistence. It can return a
+valid moved target, but a broken bookmark requiring Documents fallback returns
+unavailable and a resolved Trash location remains Trash. Neither outcome authorizes
+overwrite, cache removal or a fictitious missing-file conclusion. Default resolution
+retains the shipped Documents heal; that visible field-specific registry update has
+no established fsync proof and does not construct a durable renewal receipt.
+
+An authenticated opening read retains its historical reference through final
+publication. Its own receipt may update only that bookmark in the originating RAM
+session after the owner/target/reference fence succeeds and the action/cycle/current
+reference still match. Normal registry metadata refresh cannot supply a different
+bookmark, master-key date, key-file association or hardware configuration as new
+authority.
+
+Durable bookmark-renewal admission also requires both the source ledger and on-disk
+source enumeration to be empty, under the same owner lock. Pending, provisional or
+untracked sources defer the registry transition rather than weakening the final
+read-key/cache fence or promoting a reference from a failed publication callback.
+Resolution still returns a valid observed file without a receipt. The session and
+registry therefore keep the same bookmark through merge/save/consume; a later fresh
+read can renew after ownership is idle. Admission, retirement, key-publication,
+owner-read and revocation failures continue to reject renewal without inventing
+quiescence or changing source ownership.
+
+Sources may arrive after the durable renewal accessor returns. That renewal remains
+a bookmark transition, not permission to publish old read keys. A separate read-only
+reconciliation validates its exact before/after reference, captured owner epoch,
+coordinated target identity and authenticated ciphertext. Healthy eligible sources
+may remain during this check; provisional, missing, unknown, admitted, retiring or
+revoked ownership rejects it. The unchanged session action/cycle may then apply only
+its own bookmark field before the normal merge obtains a fresh admission and new
+installed commit receipt. Neither the old renewal target nor this observation grants
+a write, cache refresh or source consumption. If proof fails or times out, sources
+remain owned and local recovery is presented; no merge is attempted with the stale
+reference. The pre-renewal empty-source gate and final read-key/cache guards remain.

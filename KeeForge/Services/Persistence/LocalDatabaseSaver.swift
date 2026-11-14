@@ -174,6 +174,7 @@ enum LocalDatabaseSaver {
         /// cannot open. The app replaces that copy from the file, so the saved
         /// bytes are also kept as a pending local save for the app to merge.
         var awaitsWriteBack = false
+        var bookmarkRenewal: DatabaseListStore.DatabaseBookmarkRenewal? = nil
     }
 
     enum ReplaceOutcome: Sendable, Equatable {
@@ -183,6 +184,12 @@ enum LocalDatabaseSaver {
         case indeterminate
         case changed(currentData: Data)
     }
+
+    struct SecurityScopeIO: Sendable {
+        var begin: @Sendable (URL) -> Bool = { $0.startAccessingSecurityScopedResource() }
+        var end: @Sendable (URL) -> Void = { $0.stopAccessingSecurityScopedResource() }
+    }
+    @TaskLocal private static var scopedOriginalLocation: ResolvedLocation?
 
     struct ReplacementAuthorization: Sendable {
         let databaseID: UUID
@@ -213,6 +220,7 @@ enum LocalDatabaseSaver {
         /// write so no other coordinated writer can land in between.
         var replaceFileAtomically: @Sendable (_ data: Data, _ url: URL, _ expectedSHA512: Data?, _ authorization: ReplacementAuthorization) throws -> ReplaceOutcome
         var cacheDatabaseCopy: @Sendable (Data, DatabaseReference) throws -> Void
+        var localPublicationFailure: @Sendable (String, Error) -> Void = { _, _ in }
         var pendingLocalStorageIO = PendingLocalSaveStore.StorageIO()
         var hasPendingLocalSaves: @Sendable (DatabaseReference) -> Bool
 
@@ -224,7 +232,7 @@ enum LocalDatabaseSaver {
                 AppBackgroundTaskManager.end(handle)
             },
             resolveLocation: { reference in
-                LocalDatabaseSaver.resolveLocation(for: reference)
+                LocalDatabaseSaver.resolveLocation(for: reference, renewBookmark: false)
             },
             readData: { url in
                 try CoordinatedFileReader.readData(from: url)
@@ -275,7 +283,7 @@ enum LocalDatabaseSaver {
             environment.resolveLocation = { reference in
                 LocalDatabaseSaver.autoFillSavesAwaitWriteBack(for: reference)
                     ? LocalDatabaseSaver.sharedCopyLocation(for: reference)
-                    : LocalDatabaseSaver.resolveLocation(for: reference)
+                    : LocalDatabaseSaver.resolveLocation(for: reference, renewBookmark: false)
             }
             return environment
         }
@@ -358,11 +366,18 @@ enum LocalDatabaseSaver {
                 encryptionSettings: encryptionSettings,
                 environment: environment,
                 authorization: authorization
-            ) } catch let failure as LocalSaveBeforeReplacementFailure { throw failure }
+            ) } catch let failure as LocalSaveBeforeReplacementFailure {
+                environment.localPublicationFailure("save-before-replacement", failure.underlying)
+                throw failure
+            }
             catch let failure as PendingLocalSaveStore.AdmissionPublicationFailure {
+                environment.localPublicationFailure("save-admission-publication", failure)
                 throw LocalSaveBeforeReplacementFailure(underlying: SavePreReplacementRecoveryWarning(token: failure.token))
             }
-            catch { throw LocalSaveBeforeReplacementFailure(underlying: error) }
+            catch {
+                environment.localPublicationFailure("save-preparation", error)
+                throw LocalSaveBeforeReplacementFailure(underlying: error)
+            }
         }.value
     }
 
@@ -533,13 +548,17 @@ enum LocalDatabaseSaver {
                 localCommit = receipt; unconfirmed = true; warningScope = .recoveryRecord
             }
             if ordinaryToken != nil, !unconfirmed {
-                let completion = localCommit.map { completePendingMerge($0, reference: reference, io: environment.pendingLocalStorageIO) }
-                    ?? .retainedForRecovery
+                let completion = $scopedOriginalLocation.withValue(location) {
+                    localCommit.map { completePendingMerge($0, reference: reference, io: environment.pendingLocalStorageIO) }
+                        ?? .retainedForRecovery
+                }
                 if completion != .resolved { unconfirmed = true; warningScope = .recoveryRecord }
             }
             if ordinaryToken != nil, unconfirmed, let localCommit {
-                _ = try? observeOriginal(reference) { target in
-                    PendingLocalSaveStore.recordKnownOrdinaryCommit(localCommit, observeTarget: {
+                var observationError: NSError?
+                NSFileCoordinator().coordinate(readingItemAt: location.url,
+                    options: [], error: &observationError) { target in
+                    _ = PendingLocalSaveStore.recordKnownOrdinaryCommit(localCommit, observeTarget: {
                         (try PendingLocalSaveStore.targetIdentity(at: target), FileDigest.sha512(try Data(contentsOf: target)))
                     }, io: environment.pendingLocalStorageIO)
                 }
@@ -562,15 +581,19 @@ enum LocalDatabaseSaver {
             let cacheURL = DatabaseListStore.cacheLocation(for: reference)
             if canonicalPath(of: location.url) != canonicalPath(of: cacheURL),
                newCompositeKey != nil || localCommit?.purpose == .ordinarySave || environment.hasPendingLocalSaves(reference) == false {
-                PendingLocalSaveStore.$cacheCommit.withValue(localCommit) {
-                    do {
-                        try environment.cacheDatabaseCopy(newData, reference)
-                    } catch {
-                        // The file is already replaced, so the save has succeeded. An
-                        // older copy must not keep answering AutoFill for it; with
-                        // none, AutoFill reads the file or fails until a copy is written.
-                        if reference.isCloudBacked { try? FileManager.default.removeItem(at: cacheURL) }
-                        else { invalidateOlderLocalCache(for: reference, installedSHA512: FileDigest.sha512(newData)) }
+                $scopedOriginalLocation.withValue(location) {
+                    PendingLocalSaveStore.$cacheCommit.withValue(localCommit) {
+                        do {
+                            try environment.cacheDatabaseCopy(newData, reference)
+                        } catch {
+                            // The file is already replaced, so the save has succeeded. An
+                            // older copy must not keep answering AutoFill for it; with
+                            // none, AutoFill reads the file or fails until a copy is written.
+                            environment.localPublicationFailure("save-cache", error)
+                            if reference.isCloudBacked { try? FileManager.default.removeItem(at: cacheURL) }
+                            else { invalidateOlderLocalCache(for: reference, installedSHA512: FileDigest.sha512(newData),
+                                onFailure: environment.localPublicationFailure) }
+                        }
                     }
                 }
             }
@@ -619,9 +642,10 @@ enum LocalDatabaseSaver {
         return try result.get()
     }
 
-    static func resolveLocation(for reference: DatabaseReference) -> ResolvedLocation? {
-        if let url = DatabaseListStore.resolveDatabaseURL(for: reference) {
-            return ResolvedLocation(url: url, usesSecurityScope: true)
+    static func resolveLocation(for reference: DatabaseReference, renewBookmark: Bool = false) -> ResolvedLocation? {
+        var renewal: DatabaseListStore.DatabaseBookmarkRenewal?
+        if let url = DatabaseListStore.resolveDatabaseURL(for: reference, renewBookmark: renewBookmark, onBookmarkRenewal: { renewal = $0 }) {
+            return ResolvedLocation(url: url, usesSecurityScope: true, bookmarkRenewal: renewal)
         }
 
         guard reference.bookmarkData == nil else {
@@ -632,73 +656,137 @@ enum LocalDatabaseSaver {
         return ResolvedLocation(url: cachedURL, usesSecurityScope: false)
     }
 
+    private static func committedCacheTarget(for reference: DatabaseReference, sha512: Data) -> PendingLocalSaveStore.TargetIdentity? {
+        guard let commit = PendingLocalSaveStore.cacheCommit, commit.databaseID == reference.id,
+              commit.sha512 == sha512, let bytes = commit.encryptedSnapshot, FileDigest.sha512(bytes) == sha512,
+              let admission = commit.admission, admission.observedMasterKeyChangeAt == reference.lastMasterKeyChangeAt,
+              let installed = commit.installedTarget, installed.canonicalPath == admission.target.canonicalPath,
+              installed.parent == admission.target.parent else { return nil }
+        return installed
+    }
+
+    enum CachePublicationStage: String, Sendable {
+        case lease, location, reference, owner, target, write, coordination
+    }
+
     static func cacheLocalSnapshot(
         _ data: Data, for reference: DatabaseReference, lease capturedLease: PendingLocalSaveStore.CacheReadLease? = nil,
-        allowNewReference: Bool = false, legacyMigrationSource: URL? = nil
+        allowNewReference: Bool = false, legacyMigrationSource: URL? = nil,
+        onFailure: (CachePublicationStage, Error) -> Void = { _, _ in },
+        scopeIO: SecurityScopeIO = .init()
     ) throws {
-        let lease = try capturedLease ?? PendingLocalSaveStore.captureCacheReadLease(for: reference)
-        guard lease.reference.matches(reference) else { throw PendingLocalSaveStore.OwnershipError.sourceChanged }
-        let resolved: ResolvedLocation?
-        if let legacyMigrationSource {
-            guard lease.epochID == nil, let legacy = SharedVaultStore.legacyCachedDatabaseURL,
-                  canonicalPath(of: legacy) == canonicalPath(of: legacyMigrationSource) else { throw PendingLocalSaveStore.OwnershipError.sourceChanged }
-            resolved = ResolvedLocation(url: legacyMigrationSource, usesSecurityScope: false)
-        } else { resolved = resolveLocation(for: reference) }
-        guard let location = resolved, let anchor = AppGroupContainer.resolvedURL else { throw SaveError.databaseLocationUnavailable }
-        let cache = DatabaseListStore.cacheLocation(for: reference)
-        let primary = canonicalPath(of: cache) == canonicalPath(of: location.url)
-        if primary && !allowNewReference { return }
-        let access = location.usesSecurityScope && location.url.startAccessingSecurityScopedResource()
-        defer { if access { location.url.stopAccessingSecurityScopedResource() } }
-        let sha = FileDigest.sha512(data)
-        try DatabaseListStore.withLocalCacheReference(reference, allowNewReference: allowNewReference) {
-            var error: NSError?
-            var result: Result<Void, Error>?
-            func publish(original: URL?, destination: URL) {
-                result = Result {
-                    try PendingLocalSaveStore.withCachePublicationAuthorization(for: reference.id, sha512: sha, lease: lease) {
-                        if let original {
-                            guard FileDigest.sha512(try Data(contentsOf: original)) == sha else { throw PendingLocalSaveStore.OwnershipError.targetChanged }
-                        } else {
-                            guard !FileManager.default.fileExists(atPath: destination.path) else { throw PendingLocalSaveStore.OwnershipError.sourceChanged }
+        var stage = CachePublicationStage.lease
+        do {
+            var lease = try capturedLease ?? PendingLocalSaveStore.captureCacheReadLease(for: reference)
+            guard lease.reference.matches(reference) else { throw PendingLocalSaveStore.OwnershipError.sourceChanged }
+            stage = .location
+            let sha = FileDigest.sha512(data)
+            let committedTarget = committedCacheTarget(for: reference, sha512: sha)
+            let resolved: ResolvedLocation?
+            if let scoped = scopedOriginalLocation {
+                resolved = scoped
+            } else if let legacyMigrationSource {
+                guard lease.epochID == nil, let legacy = SharedVaultStore.legacyCachedDatabaseURL,
+                      canonicalPath(of: legacy) == canonicalPath(of: legacyMigrationSource) else { throw PendingLocalSaveStore.OwnershipError.sourceChanged }
+                resolved = ResolvedLocation(url: legacyMigrationSource, usesSecurityScope: false)
+            } else { resolved = resolveLocation(for: reference, renewBookmark: false) }
+            guard let location = resolved, let anchor = AppGroupContainer.resolvedURL else { throw SaveError.databaseLocationUnavailable }
+            if lease.bookmarkRenewal == nil { lease.bookmarkRenewal = location.bookmarkRenewal }
+            let cache = DatabaseListStore.cacheLocation(for: reference)
+            let primary = canonicalPath(of: cache) == canonicalPath(of: location.url)
+            if primary && !allowNewReference { return }
+            let access = location.usesSecurityScope && scopeIO.begin(location.url)
+            defer { if access { scopeIO.end(location.url) } }
+            stage = .reference
+            try DatabaseListStore.withLocalCacheReference(reference, allowNewReference: allowNewReference, lease: lease) {
+                var error: NSError?
+                var result: Result<Void, Error>?
+                func publish(original: URL?, destination: URL) {
+                    result = Result {
+                        stage = .owner
+                        try PendingLocalSaveStore.withCachePublicationAuthorization(for: reference.id, sha512: sha, lease: lease) {
+                            stage = .target
+                            if let original {
+                                if let committedTarget {
+                                    guard try PendingLocalSaveStore.targetIdentity(at: original) == committedTarget else { throw PendingLocalSaveStore.OwnershipError.targetChanged }
+                                }
+                                if let renewal = lease.bookmarkRenewal {
+                                    guard try PendingLocalSaveStore.targetIdentity(at: original) == renewal.target else { throw PendingLocalSaveStore.OwnershipError.targetChanged }
+                                }
+                                guard FileDigest.sha512(try Data(contentsOf: original)) == sha else { throw PendingLocalSaveStore.OwnershipError.targetChanged }
+                            } else {
+                                guard !FileManager.default.fileExists(atPath: destination.path) else { throw PendingLocalSaveStore.OwnershipError.sourceChanged }
+                            }
+                            stage = .write
+                            try writeAtomicallyAndDurably(data, to: destination, directoryAnchor: anchor)
                         }
-                        try writeAtomicallyAndDurably(data, to: destination, directoryAnchor: anchor)
                     }
                 }
+                let coordinator = NSFileCoordinator()
+                if primary {
+                    coordinator.coordinate(writingItemAt: cache, options: .forReplacing, error: &error) { publish(original: nil, destination: $0) }
+                } else {
+                    coordinator.coordinate(readingItemAt: location.url, options: [], writingItemAt: cache, options: .forReplacing,
+                        error: &error) { publish(original: $0, destination: $1) }
+                }
+                if let error { stage = .coordination; throw error }
+                guard let result else { throw SaveError.databaseLocationUnavailable }
+                try result.get()
             }
-            let coordinator = NSFileCoordinator()
-            if primary {
-                coordinator.coordinate(writingItemAt: cache, options: .forReplacing, error: &error) { publish(original: nil, destination: $0) }
-            } else {
-                coordinator.coordinate(readingItemAt: location.url, options: [], writingItemAt: cache, options: .forReplacing,
-                    error: &error) { publish(original: $0, destination: $1) }
-            }
-            if let error { throw error }
-            guard let result else { throw SaveError.databaseLocationUnavailable }
-            try result.get()
+        } catch {
+            onFailure(stage, error)
+            throw error
         }
     }
 
-    private static func invalidateOlderLocalCache(for reference: DatabaseReference, installedSHA512: Data) {
-        guard let lease = try? PendingLocalSaveStore.captureCacheReadLease(for: reference),
-              let location = resolveLocation(for: reference) else { return }
-        let cache = DatabaseListStore.cacheLocation(for: reference)
-        guard canonicalPath(of: cache) != canonicalPath(of: location.url) else { return }
-        let access = location.usesSecurityScope && location.url.startAccessingSecurityScopedResource()
-        defer { if access { location.url.stopAccessingSecurityScopedResource() } }
-        var coordinatorError: NSError?
-        try? DatabaseListStore.withLocalCacheReference(reference, allowNewReference: false) {
-            NSFileCoordinator().coordinate(readingItemAt: location.url, options: [], writingItemAt: cache,
-                options: .forDeleting, error: &coordinatorError) { original, destination in
-                try? PendingLocalSaveStore.withCachePublicationAuthorization(for: reference.id, sha512: installedSHA512, lease: lease) {
-                    guard FileDigest.sha512(try Data(contentsOf: original)) == installedSHA512 else { return }
-                    let data = try Data(contentsOf: destination)
-                    guard FileDigest.sha512(data) != installedSHA512 else { return }
-                    try FileManager.default.removeItem(at: destination)
-                    try synchronizeDirectory(destination.deletingLastPathComponent())
+    private static func invalidateOlderLocalCache(
+        for reference: DatabaseReference, installedSHA512: Data,
+        onFailure: (String, Error) -> Void = { _, _ in }, scopeIO: SecurityScopeIO = .init()
+    ) {
+        var stage = "invalidate-lease"
+        do {
+            var lease = try PendingLocalSaveStore.captureCacheReadLease(for: reference)
+            stage = "invalidate-location"
+            let committedTarget = committedCacheTarget(for: reference, sha512: installedSHA512)
+            let location = scopedOriginalLocation ?? resolveLocation(for: reference, renewBookmark: false)
+            guard let location else { throw SaveError.databaseLocationUnavailable }
+            if lease.bookmarkRenewal == nil { lease.bookmarkRenewal = location.bookmarkRenewal }
+            let cache = DatabaseListStore.cacheLocation(for: reference)
+            guard canonicalPath(of: cache) != canonicalPath(of: location.url) else { return }
+            let access = location.usesSecurityScope && scopeIO.begin(location.url)
+            defer { if access { scopeIO.end(location.url) } }
+            stage = "invalidate-reference"
+            try DatabaseListStore.withLocalCacheReference(reference, allowNewReference: false, lease: lease) {
+                var coordinatorError: NSError?
+                var result: Result<Void, Error>?
+                NSFileCoordinator().coordinate(readingItemAt: location.url, options: [], writingItemAt: cache,
+                    options: .forDeleting, error: &coordinatorError) { original, destination in
+                    result = Result {
+                        stage = "invalidate-owner"
+                        try PendingLocalSaveStore.withCachePublicationAuthorization(for: reference.id, sha512: installedSHA512, lease: lease) {
+                            stage = "invalidate-target"
+                            if let committedTarget {
+                                guard try PendingLocalSaveStore.targetIdentity(at: original) == committedTarget else { throw PendingLocalSaveStore.OwnershipError.targetChanged }
+                            }
+                            if let renewal = lease.bookmarkRenewal {
+                                guard try PendingLocalSaveStore.targetIdentity(at: original) == renewal.target else { throw PendingLocalSaveStore.OwnershipError.targetChanged }
+                            }
+                            guard FileDigest.sha512(try Data(contentsOf: original)) == installedSHA512 else {
+                                throw PendingLocalSaveStore.OwnershipError.targetChanged
+                            }
+                            let data = try Data(contentsOf: destination)
+                            guard FileDigest.sha512(data) != installedSHA512 else { return }
+                            stage = "invalidate-delete"
+                            try FileManager.default.removeItem(at: destination)
+                            try synchronizeDirectory(destination.deletingLastPathComponent())
+                        }
+                    }
                 }
+                if let coordinatorError { stage = "invalidate-coordination"; throw coordinatorError }
+                guard let result else { throw SaveError.databaseLocationUnavailable }
+                try result.get()
             }
-        }
+        } catch { onFailure(stage, error) }
     }
 
     static func retireSettledKeyWitness(for reference: DatabaseReference, io: PendingLocalSaveStore.StorageIO = .init()) -> PendingLocalSaveStore.ResolutionOutcome {
@@ -764,7 +852,7 @@ enum LocalDatabaseSaver {
     }
 
     static func captureTarget(for reference: DatabaseReference) throws -> PendingLocalSaveStore.TargetIdentity {
-        guard let location = resolveLocation(for: reference) else { throw SaveError.databaseLocationUnavailable }
+        guard let location = resolveLocation(for: reference, renewBookmark: false) else { throw SaveError.databaseLocationUnavailable }
         let access = location.usesSecurityScope && location.url.startAccessingSecurityScopedResource()
         defer { if access { location.url.stopAccessingSecurityScopedResource() } }
         var coordinatorError: NSError?
@@ -779,16 +867,27 @@ enum LocalDatabaseSaver {
 
     static func completePendingMerge(
         _ receipt: PendingLocalSaveStore.CommitReceipt, reference: DatabaseReference,
-        io: PendingLocalSaveStore.StorageIO = .init()
+        io: PendingLocalSaveStore.StorageIO = .init(), scopeIO: SecurityScopeIO = .init()
     ) -> PendingLocalSaveStore.ResolutionOutcome {
         do {
-            let completion = try observeOriginal(reference) { url in
-                PendingLocalSaveStore.complete(receipt, observeTarget: {
-                    (try PendingLocalSaveStore.targetIdentity(at: url), FileDigest.sha512(try Data(contentsOf: url)))
-                }, io: io)
+            return try withOriginalScope(reference, scopeIO: scopeIO) { location in
+                let completion = try observeOriginal(at: location.url) { url in
+                    PendingLocalSaveStore.complete(receipt, observeTarget: {
+                        (try PendingLocalSaveStore.targetIdentity(at: url), FileDigest.sha512(try Data(contentsOf: url)))
+                    }, io: io)
+                }
+                guard completion == .resolved else { return completion }
+                return $scopedOriginalLocation.withValue(location) {
+                    if receipt.purpose == .merge, let bytes = receipt.encryptedSnapshot,
+                       FileDigest.sha512(bytes) == receipt.sha512 {
+                        PendingLocalSaveStore.$cacheCommit.withValue(receipt) {
+                            do { try cacheLocalSnapshot(bytes, for: reference, scopeIO: scopeIO) }
+                            catch { invalidateOlderLocalCache(for: reference, installedSHA512: receipt.sha512, scopeIO: scopeIO) }
+                        }
+                    }
+                    return retireSettledKeyWitness(for: reference, io: io)
+                }
             }
-            guard completion == .resolved else { return completion }
-            return retireSettledKeyWitness(for: reference, io: io)
         } catch { return .retainedForRecovery }
     }
 
@@ -859,15 +958,28 @@ enum LocalDatabaseSaver {
         }
     }
 
+    private static func withOriginalScope<T>(
+        _ reference: DatabaseReference, scopeIO: SecurityScopeIO = .init(), _ body: (ResolvedLocation) throws -> T
+    ) throws -> T {
+        guard let location = scopedOriginalLocation ?? resolveLocation(for: reference, renewBookmark: false),
+              !location.awaitsWriteBack else { throw SaveError.databaseLocationUnavailable }
+        let access = location.usesSecurityScope && scopeIO.begin(location.url)
+        defer { if access { scopeIO.end(location.url) } }
+        return try body(location)
+    }
+
     private static func observeOriginal(_ reference: DatabaseReference,
         _ observe: (URL) throws -> PendingLocalSaveStore.ResolutionOutcome
     ) throws -> PendingLocalSaveStore.ResolutionOutcome {
-        guard let location = resolveLocation(for: reference), !location.awaitsWriteBack else { throw SaveError.databaseLocationUnavailable }
-        let access = location.usesSecurityScope && location.url.startAccessingSecurityScopedResource()
-        defer { if access { location.url.stopAccessingSecurityScopedResource() } }
+        try withOriginalScope(reference) { try observeOriginal(at: $0.url, observe) }
+    }
+
+    private static func observeOriginal(at url: URL,
+        _ observe: (URL) throws -> PendingLocalSaveStore.ResolutionOutcome
+    ) throws -> PendingLocalSaveStore.ResolutionOutcome {
         var coordinatorError: NSError?
         var result: Result<PendingLocalSaveStore.ResolutionOutcome, Error>?
-        NSFileCoordinator().coordinate(readingItemAt: location.url, options: [], error: &coordinatorError) { url in
+        NSFileCoordinator().coordinate(readingItemAt: url, options: [], error: &coordinatorError) { url in
             result = Result { try observe(url) }
         }
         if let coordinatorError {
@@ -968,6 +1080,7 @@ enum LocalDatabaseSaver {
         var synchronize: @Sendable (URL) throws -> Void = synchronizeDirectory
         // Models a file-provider error reported after its coordinated accessor returns.
         var coordinationCompletion: @Sendable () throws -> Void = {}
+        var observedFailure: @Sendable (String, Error) -> Void = { _, _ in }
     }
 
     static func replaceFileAtomically(
@@ -979,6 +1092,8 @@ enum LocalDatabaseSaver {
         var coordinatorError: NSError?
         var result: Result<ReplaceOutcome, Error>?
         var enteredReplacement = false
+        var failureObservation: (String, Error)?
+        var phase = "baseline"
         var observedEffect: PendingLocalSaveStore.TargetCommit?
         var targetWrite: PendingLocalSaveStore.TargetWriteToken?
 
@@ -989,6 +1104,7 @@ enum LocalDatabaseSaver {
                         let current = try Data(contentsOf: readingURL ?? writingURL)
                         guard FileDigest.sha512(current) == expectedSHA512 else { return .changed(currentData: current) }
                     }
+                    phase = "staging"
                     let stagingDirectory = try manager.url(for: .itemReplacementDirectory, in: .userDomainMask,
                         appropriateFor: writingURL, create: true)
                     defer { try? manager.removeItem(at: stagingDirectory) }
@@ -996,10 +1112,14 @@ enum LocalDatabaseSaver {
                     try io.stage(data, staged)
                     let perform: (PendingLocalSaveStore.CommitReceipt?) throws -> ReplaceOutcome = { receipt in
                         enteredReplacement = true
+                        phase = "replacement"
                         var replacementThrew = false
                         do {
                             _ = try manager.replaceItemAt(writingURL, withItemAt: staged, backupItemName: nil, options: [])
-                        } catch { replacementThrew = true }
+                        } catch {
+                            replacementThrew = true
+                            failureObservation = (phase, error)
+                        }
                         guard let installed = try? Data(contentsOf: writingURL), FileDigest.sha512(installed) == intended,
                               let identity = try? PendingLocalSaveStore.targetIdentity(at: writingURL) else { return .indeterminate }
                         var installedReceipt = receipt
@@ -1017,6 +1137,7 @@ enum LocalDatabaseSaver {
                         return durable ? .replaced(installedReceipt) : .replacedWithoutConfirmedDurability(installedReceipt)
                     }
                     if let authorization {
+                        phase = "owner"
                         let authorized = try PendingLocalSaveStore.withWriteAuthorization(
                             for: authorization.databaseID, token: authorization.token,
                             expectedMasterKeyChangeAt: authorization.expectedMasterKeyChangeAt,
@@ -1038,6 +1159,7 @@ enum LocalDatabaseSaver {
                 } catch let conflict as CoordinatedConflict { return .changed(currentData: conflict.currentData) }
                 catch let failure as LocalSaveBeforeReplacementFailure { throw failure }
                 catch {
+                    failureObservation = (phase, error)
                     if enteredReplacement { return .indeterminate }
                     if let failure = error as? PendingLocalSaveStore.AdmissionPublicationFailure {
                         let release = PendingLocalSaveStore.releaseAfterProvenNoReplacement(failure.token,
@@ -1059,6 +1181,7 @@ enum LocalDatabaseSaver {
                 access(readingURL: nil, writingURL: $0)
             }
         }
+        if let (phase, error) = failureObservation { io.observedFailure(phase, error) }
         func finalize(_ outcome: ReplaceOutcome, coordinationFailed: Bool = false) -> ReplaceOutcome {
             var finalOutcome = outcome
             if coordinationFailed {
@@ -1093,6 +1216,7 @@ enum LocalDatabaseSaver {
             if let coordinatorError { throw coordinatorError }
             try io.coordinationCompletion()
         } catch {
+            io.observedFailure("coordination-completion", error)
             if case .success(let outcome)? = result { return finalize(outcome, coordinationFailed: true) }
             if enteredReplacement { return .indeterminate }
             throw LocalSaveBeforeReplacementFailure(underlying: error)

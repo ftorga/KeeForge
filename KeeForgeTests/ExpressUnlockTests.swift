@@ -530,12 +530,15 @@ final class ExpressUnlockTests: XCTestCase {
 
 
     private func makeCloudEnvironment(cacheURL: URL, uploaded: UploadedBytes) -> CloudDatabaseSaver.Environment {
-        let backupDirectory = cacheURL.deletingLastPathComponent().appendingPathComponent("Backups", isDirectory: true)
+        let anchor = cacheURL.deletingLastPathComponent()
+        let backupDirectory = anchor.appendingPathComponent("Backups", isDirectory: true)
         var environment = CloudDatabaseSaver.Environment.live
         environment.beginBackgroundTask = { _ in .invalid }
         environment.endBackgroundTask = { _ in }
         environment.cacheURL = { _ in cacheURL }
         environment.backupDirectoryURL = { _ in backupDirectory }
+        environment.createDirectory = { url in try createDurableDirectory(at: url, anchor: anchor) }
+        environment.writeBackup = { data, url in try writeAtomicallyAndDurably(data, to: url, directoryAnchor: anchor) }
         environment.pruneBackups = { _, _ in }
         environment.getMetadata = { _ in
             CloudFileMetadata(modifiedDate: Date(timeIntervalSince1970: 100), contentHash: nil, size: 0, rev: "rev-1")
@@ -950,7 +953,7 @@ final class DatabaseViewModelExpressUnlockTests: XCTestCase {
             databaseReference: reference,
             localSaveOperation: localSave,
             biometricCompositeKeyOperation: biometricKeys,
-            quickUnlockKeyPersistOperation: { keys, _, masterKeyEntered in
+            localReadKeyPersistOperation: { keys, _, masterKeyEntered in
                 persisted.record(keys, masterKeyEntered: masterKeyEntered)
                 return storesQuickUnlockKey
             },
@@ -1019,13 +1022,11 @@ private final class ExpressKeySaves: @unchecked Sendable {
     func record(_ key: ExpressUnlockKey?) { storage.withLock { $0.append(key) } }
 }
 
-@MainActor
-private final class PersistedKeys {
-    private(set) var last: QuickUnlockKeys?
-    private(set) var lastMasterKeyEntered: Bool?
-
+private final class PersistedKeys: @unchecked Sendable {
+    private let storage = OSAllocatedUnfairLock(initialState: (keys: Optional<QuickUnlockKeys>.none, entered: Optional<Bool>.none))
+    var last: QuickUnlockKeys? { storage.withLock { $0.keys } }
+    var lastMasterKeyEntered: Bool? { storage.withLock { $0.entered } }
     func record(_ keys: QuickUnlockKeys, masterKeyEntered: Bool) {
-        last = keys
-        lastMasterKeyEntered = masterKeyEntered
+        storage.withLock { $0 = (keys, masterKeyEntered) }
     }
 }

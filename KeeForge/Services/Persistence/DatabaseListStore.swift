@@ -465,7 +465,7 @@ enum DatabaseListStore {
         io: PendingLocalSaveStore.StorageIO = .init()
     ) -> PendingLocalSaveStore.ResolutionOutcome {
         withStateLock {
-            guard let anchor = AppGroupContainer.resolvedURL, let target = LocalDatabaseSaver.resolveLocation(for: expected)?.url else { return .retainedForRecovery }
+            guard let anchor = AppGroupContainer.resolvedURL, let target = LocalDatabaseSaver.resolveLocation(for: expected, renewBookmark: false)?.url else { return .retainedForRecovery }
             let access = target.startAccessingSecurityScopedResource()
             defer { if access { target.stopAccessingSecurityScopedResource() } }
             var error: NSError?
@@ -522,36 +522,60 @@ enum DatabaseListStore {
         }
     }
 
-    static func currentSameEpochPreference(for reference: DatabaseReference) throws -> PendingLocalSaveStore.KeyFilePreference {
-        let owner = try PendingLocalSaveStore.recovery(for: reference.id)
-        guard !owner.ownerUnavailable, !owner.isRevoked else { throw PendingLocalSaveStore.OwnershipError.recoveryRequired }
-        if owner.keyEvidence == nil {
-            guard let current = databases.first(where: { $0.id == reference.id }) else { return PendingLocalSaveStore.KeyFilePreference(reference) }
-            let preference = PendingLocalSaveStore.KeyFilePreference(current)
-            guard PendingLocalSaveStore.PreferenceObservation(reference).matches(current, preference: preference) else {
-                throw PendingLocalSaveStore.OwnershipError.sourceChanged
-            }
-            return preference
-        }
-        return try withStateLock {
-            var error: NSError?
-            var result: Result<PendingLocalSaveStore.KeyFilePreference, Error>?
-            NSFileCoordinator().coordinate(readingItemAt: databaseListURL, options: [], error: &error) { url in
-                result = Result {
-                    let references = try JSONDecoder().decode([DatabaseReference].self, from: Data(contentsOf: url))
-                    guard let current = references.first(where: { $0.id == reference.id }),
-                          PendingLocalSaveStore.PreferenceObservation(reference).matches(current,
-                              preference: PendingLocalSaveStore.KeyFilePreference(current)) else {
-                        throw PendingLocalSaveStore.OwnershipError.sourceChanged
-                    }
-                    try PendingLocalSaveStore.validateReferenceAssociation(current)
-                    return PendingLocalSaveStore.KeyFilePreference(current)
+    static func localReferenceEqualityDiagnostic(_ expected: DatabaseReference, current: DatabaseReference?) -> String {
+        guard let current else { return "registered=false id=false bookmark=false date=false keyBookmark=false keyFilename=false cloud=false hardware=false filename=false legacy=false" }
+        let observed = PendingLocalSaveStore.PreferenceObservation(current)
+        let before = PendingLocalSaveStore.PreferenceObservation(expected)
+        return "registered=true id=\(current.id == expected.id) bookmark=\(current.bookmarkData == expected.bookmarkData) date=\(current.lastMasterKeyChangeAt == expected.lastMasterKeyChangeAt) keyBookmark=\(current.keyFileBookmarkData == expected.keyFileBookmarkData) keyFilename=\(current.keyFileFilename == expected.keyFileFilename) cloud=\(observed.cloudIdentity == before.cloudIdentity) hardware=\(current.hardwareKey == expected.hardwareKey) filename=\(current.filename == expected.filename) legacy=\(current.legacyKeychainFilename == expected.legacyKeychainFilename)"
+    }
+
+    static func currentSameEpochPreference(for reference: DatabaseReference,
+        onFailure: (String, Error) -> Void = { _, _ in }
+    ) throws -> PendingLocalSaveStore.KeyFilePreference {
+        var phase = "same-epoch-owner"
+        do {
+            let owner = try PendingLocalSaveStore.recovery(for: reference.id)
+            guard !owner.ownerUnavailable, !owner.isRevoked else { throw PendingLocalSaveStore.OwnershipError.recoveryRequired }
+            if owner.keyEvidence == nil {
+                let current = databases.first(where: { $0.id == reference.id })
+                phase = "same-epoch-reference " + localReferenceEqualityDiagnostic(reference, current: current)
+                    + " ownerUnavailable=\(owner.ownerUnavailable) revoked=\(owner.isRevoked) unresolved=\(owner.needsRecovery)"
+                guard let current else { return PendingLocalSaveStore.KeyFilePreference(reference) }
+                let preference = PendingLocalSaveStore.KeyFilePreference(current)
+                guard PendingLocalSaveStore.PreferenceObservation(reference).matches(current, preference: preference) else {
+                    throw PendingLocalSaveStore.OwnershipError.sourceChanged
                 }
+                return preference
             }
-            if let error { throw error }
-            guard let result else { throw PendingLocalSaveStore.OwnershipError.recoveryRequired }
-            return try result.get()
-        }
+            phase = "same-epoch-registry"
+            return try withStateLock {
+                var error: NSError?
+                var result: Result<PendingLocalSaveStore.KeyFilePreference, Error>?
+                NSFileCoordinator().coordinate(readingItemAt: databaseListURL, options: [], error: &error) { url in
+                    result = Result {
+                        let references = try JSONDecoder().decode([DatabaseReference].self, from: Data(contentsOf: url))
+                        let current = references.first(where: { $0.id == reference.id })
+                        phase = "same-epoch-accessor " + localReferenceEqualityDiagnostic(reference, current: current)
+                        guard let current, PendingLocalSaveStore.PreferenceObservation(reference).matches(current,
+                                  preference: PendingLocalSaveStore.KeyFilePreference(current)) else {
+                            throw PendingLocalSaveStore.OwnershipError.sourceChanged
+                        }
+                        try PendingLocalSaveStore.validateReferenceAssociation(current)
+                        return PendingLocalSaveStore.KeyFilePreference(current)
+                    }
+                }
+                if let error {
+                    switch result {
+                    case .success?: phase = "same-epoch-coordination-after-success"
+                    case .failure?: phase = "same-epoch-coordination-after-failure"
+                    case nil: phase = "same-epoch-coordination-before-accessor"
+                    }
+                    throw error
+                }
+                guard let result else { throw PendingLocalSaveStore.OwnershipError.recoveryRequired }
+                return try result.get()
+            }
+        } catch { onFailure(phase, error); throw error }
     }
 
     static func publishRegistryKeyFilePreference(
@@ -988,10 +1012,24 @@ enum DatabaseListStore {
         let actionID: UUID
         let lockCycleID: Int
         private let lock = NSLock()
+        enum WorkerCompletion: Sendable, Equatable {
+            case pending, claimedPending, finishedWithoutClaim, finishedAfterClaim
+        }
         private var value = State.pending
+        private var workerFinished = false
         init(actionID: UUID, lockCycleID: Int) { self.actionID = actionID; self.lockCycleID = lockCycleID }
         var state: State { lock.lock(); defer { lock.unlock() }; return value }
         func close() { lock.lock(); defer { lock.unlock() }; if value == .pending { value = .closed } }
+        var workerCompletion: WorkerCompletion {
+            lock.lock(); defer { lock.unlock() }
+            if workerFinished { return value == .claimed ? .finishedAfterClaim : .finishedWithoutClaim }
+            return value == .claimed ? .claimedPending : .pending
+        }
+        func finishWorker() {
+            lock.lock(); defer { lock.unlock() }
+            workerFinished = true
+            if value == .pending { value = .closed }
+        }
         func claim() -> Bool {
             lock.lock(); defer { lock.unlock() }
             guard value == .pending else { return false }
@@ -1017,6 +1055,7 @@ enum DatabaseListStore {
         for expected: DatabaseReference, receipt: PendingLocalSaveStore.CommitReceipt,
         permit: KeyCommitPublicationPermit, io: KeyCommitPublicationIO = .init(), _ publish: () throws -> T
     ) throws -> T {
+        defer { permit.close() }
         guard permit.state == .pending else { throw PendingLocalSaveStore.OwnershipError.recoveryRequired }
         let observed = try withStateLock {
             let references = try JSONDecoder().decode([DatabaseReference].self, from: Data(contentsOf: databaseListURL))
@@ -1102,29 +1141,114 @@ enum DatabaseListStore {
     }
 
     static func withLocalReadKeyPublication<T>(
-        for expected: DatabaseReference, read: PendingLocalSaveStore.ReadKeyPublication, _ publish: () throws -> T
+        for expected: DatabaseReference, read: PendingLocalSaveStore.ReadKeyPublication,
+        permit: KeyCommitPublicationPermit, io: KeyCommitPublicationIO = .init(), _ publish: () throws -> T
     ) throws -> T {
-        try withStateLock {
+        defer { permit.close() }
+        guard permit.state == .pending else { throw PendingLocalSaveStore.OwnershipError.recoveryRequired }
+        guard let authenticated = read.encryptedSnapshot,
+              FileDigest.sha512(authenticated) == read.sha512 else { throw PendingLocalSaveStore.OwnershipError.sourceChanged }
+        let observed = try withStateLock {
             let references = try JSONDecoder().decode([DatabaseReference].self, from: Data(contentsOf: databaseListURL))
-            guard let current = references.first(where: { $0.id == expected.id }),
-                  read.lease.reference.matches(current), current.hardwareKey == expected.hardwareKey,
-                  current.legacyKeychainFilename == expected.legacyKeychainFilename else {
+            guard let current = references.first(where: { $0.id == expected.id }) else { throw PendingLocalSaveStore.OwnershipError.removed }
+            guard !current.isCloudBacked,
+                  current.hardwareKey == expected.hardwareKey, current.legacyKeychainFilename == expected.legacyKeychainFilename else {
                 throw PendingLocalSaveStore.OwnershipError.sourceChanged
             }
-            return try PendingLocalSaveStore.withReadKeyPublicationAuthorization(read, publish)
+            if let renewal = read.lease.bookmarkRenewal {
+                guard renewal.matches(expected, current: current, lease: read.lease), !read.sharedCopy,
+                      read.target == renewal.target else { throw PendingLocalSaveStore.OwnershipError.sourceChanged }
+            } else if !read.lease.reference.matches(current) { throw PendingLocalSaveStore.OwnershipError.sourceChanged }
+            return current
         }
+        guard permit.state == .pending else { throw PendingLocalSaveStore.OwnershipError.recoveryRequired }
+        let target: URL
+        if !read.sharedCopy, let bookmark = observed.bookmarkData {
+            guard let resolved = io.resolve(bookmark) else { throw PendingLocalSaveStore.OwnershipError.targetChanged }
+            target = resolved.url
+        } else { target = cacheLocation(for: observed) }
+        let access = !read.sharedCopy && target.startAccessingSecurityScopedResource()
+        defer { if access { target.stopAccessingSecurityScopedResource() } }
+        var result: Result<T, Error>?
+        var coordinatorError: Error?
+        do {
+            try io.coordinate(target, databaseListURL) { protectedTarget, registry in
+                result = Result {
+                    guard permit.state == .pending else { throw PendingLocalSaveStore.OwnershipError.recoveryRequired }
+                    let identity = try PendingLocalSaveStore.targetIdentity(at: protectedTarget)
+                    let bytes = try io.read(protectedTarget)
+                    guard identity == read.target, bytes == authenticated else { throw PendingLocalSaveStore.OwnershipError.targetChanged }
+                    guard stateLock.try() else { throw PendingLocalSaveStore.OwnershipError.recoveryRequired }
+                    defer { stateLock.unlock() }
+                    let references = try JSONDecoder().decode([DatabaseReference].self, from: Data(contentsOf: registry))
+                    guard let current = references.first(where: { $0.id == expected.id }) else { throw PendingLocalSaveStore.OwnershipError.removed }
+                    guard current == observed else {
+                        throw PendingLocalSaveStore.OwnershipError.sourceChanged
+                    }
+                    return try PendingLocalSaveStore.withReadKeyPublicationAuthorization(read) {
+                        try io.beforeEffect()
+                        guard permit.claim() else { throw PendingLocalSaveStore.OwnershipError.recoveryRequired }
+                        return try publish()
+                    }
+                }
+            }
+        } catch { coordinatorError = error }
+        if let result { return try result.get() }
+        throw coordinatorError ?? CocoaError(.fileReadUnknown)
+    }
+
+    static func authenticatedBookmarkRenewalForMerge(
+        for expected: DatabaseReference, read: PendingLocalSaveStore.ReadKeyPublication,
+        io: KeyCommitPublicationIO = .init()
+    ) throws -> DatabaseBookmarkRenewal {
+        guard let renewal = read.lease.bookmarkRenewal, let authenticated = read.encryptedSnapshot,
+              !read.sharedCopy, FileDigest.sha512(authenticated) == read.sha512,
+              renewal.target == read.target else { throw PendingLocalSaveStore.OwnershipError.sourceChanged }
+        let observed = try withStateLock {
+            let references = try JSONDecoder().decode([DatabaseReference].self, from: Data(contentsOf: databaseListURL))
+            guard let current = references.first(where: { $0.id == expected.id }) else { throw PendingLocalSaveStore.OwnershipError.removed }
+            guard renewal.matches(expected, current: current, lease: read.lease), !current.isCloudBacked else {
+                throw PendingLocalSaveStore.OwnershipError.sourceChanged
+            }
+            return current
+        }
+        guard let bookmark = observed.bookmarkData, let resolved = io.resolve(bookmark) else {
+            throw PendingLocalSaveStore.OwnershipError.targetChanged
+        }
+        let access = resolved.url.startAccessingSecurityScopedResource()
+        defer { if access { resolved.url.stopAccessingSecurityScopedResource() } }
+        var result: Result<DatabaseBookmarkRenewal, Error>?
+        try io.coordinate(resolved.url, databaseListURL) { target, registry in
+            result = Result {
+                let identity = try PendingLocalSaveStore.targetIdentity(at: target)
+                let bytes = try io.read(target)
+                guard identity == read.target, bytes == authenticated else { throw PendingLocalSaveStore.OwnershipError.targetChanged }
+                guard stateLock.try() else { throw PendingLocalSaveStore.OwnershipError.recoveryRequired }
+                defer { stateLock.unlock() }
+                let references = try JSONDecoder().decode([DatabaseReference].self, from: Data(contentsOf: registry))
+                guard references.first(where: { $0.id == expected.id }) == observed else {
+                    throw PendingLocalSaveStore.OwnershipError.sourceChanged
+                }
+                try PendingLocalSaveStore.validateBookmarkRenewalForMerge(read)
+                return renewal
+            }
+        }
+        guard let result else { throw CocoaError(.fileReadUnknown) }
+        return try result.get()
     }
 
     static func withLocalCacheReference<T>(
-        _ expected: DatabaseReference, allowNewReference: Bool, _ publish: () throws -> T
+        _ expected: DatabaseReference, allowNewReference: Bool,
+        lease: PendingLocalSaveStore.CacheReadLease? = nil, _ publish: () throws -> T
     ) throws -> T {
         try withStateLock {
             let references: [DatabaseReference]
             do { references = try JSONDecoder().decode([DatabaseReference].self, from: Data(contentsOf: databaseListURL)) }
             catch let error as CocoaError where allowNewReference && error.code == .fileReadNoSuchFile { references = [] }
             if let current = references.first(where: { $0.id == expected.id }) {
-                guard PendingLocalSaveStore.PreferenceObservation(expected).matches(current),
-                      current.filename == expected.filename else { throw PendingLocalSaveStore.OwnershipError.sourceChanged }
+                let unchanged = PendingLocalSaveStore.PreferenceObservation(expected).matches(current) && current.filename == expected.filename
+                let renewed = lease.flatMap { value in value.bookmarkRenewal.map { $0.matches(expected, current: current, lease: value) } } == true
+                guard unchanged || renewed else { throw PendingLocalSaveStore.OwnershipError.sourceChanged }
             } else if !allowNewReference { throw PendingLocalSaveStore.OwnershipError.removed }
             return try publish()
         }
@@ -1218,15 +1342,36 @@ enum DatabaseListStore {
     /// path `Documents/<filename>` (Finder replace over USB is delete+recopy,
     /// stranding the old bookmark), so a failed or trashed resolution rebinds
     /// to the file currently at that path when one exists.
+    struct DatabaseBookmarkRenewal: Sendable, Equatable {
+        let before: DatabaseReference
+        let after: DatabaseReference
+        let epochID: UUID?
+        let target: PendingLocalSaveStore.TargetIdentity
+        fileprivate init(before: DatabaseReference, after: DatabaseReference, epochID: UUID?, target: PendingLocalSaveStore.TargetIdentity) {
+            self.before = before
+            self.after = after
+            self.epochID = epochID
+            self.target = target
+        }
+        func matches(_ expected: DatabaseReference, current: DatabaseReference, lease: PendingLocalSaveStore.CacheReadLease) -> Bool {
+            before == expected && after == current && lease.databaseID == before.id
+                && lease.epochID == epochID && lease.masterKeyChangedAt == before.lastMasterKeyChangeAt
+                && lease.reference.matches(before)
+        }
+    }
+
     static func locateDatabaseFile(
         for reference: DatabaseReference,
         resolveBookmark: (Data) -> (url: URL, isStale: Bool)? = SecurityScopedBookmarkManager.resolveURL,
-        beforeBookmarkRenewal: () throws -> Void = {}
+        renewBookmark: Bool = true,
+        beforeBookmarkRenewal: () throws -> Void = {},
+        bookmarkRenewalIO: DurableFileWriteIO = .init(),
+        onBookmarkRenewal: (DatabaseBookmarkRenewal) -> Void = { _ in }
     ) -> LocalDatabaseFileLocation? {
-        let lease = try? PendingLocalSaveStore.captureCacheReadLease(for: reference)
+        let lease = renewBookmark ? (try? PendingLocalSaveStore.captureCacheReadLease(for: reference)) : nil
         guard let bookmarkData = reference.bookmarkData,
               let resolved = resolveBookmark(bookmarkData) else {
-            return reboundDocumentsResidentLocation(for: reference)
+            return renewBookmark ? reboundDocumentsResidentLocation(for: reference) : nil
         }
 
         let url = resolved.url
@@ -1238,51 +1383,60 @@ enum DatabaseListStore {
         }
 
         if SecurityScopedBookmarkManager.isInTrashDirectory(url) {
-            if let rebound = reboundDocumentsResidentLocation(for: reference) {
+            if renewBookmark, let rebound = reboundDocumentsResidentLocation(for: reference) {
                 return rebound
             }
             return .inTrash(url)
         }
 
-        if resolved.isStale,
+        if renewBookmark, resolved.isStale,
            let refreshedBookmarkData = try? SecurityScopedBookmarkManager.makeBookmarkData(for: url) {
             do {
                 try beforeBookmarkRenewal()
-                if let lease { renewDatabaseBookmark(refreshedBookmarkData, expected: reference, lease: lease) }
+                if let lease, let renewal = renewDatabaseBookmark(refreshedBookmarkData, expected: reference,
+                    lease: lease, targetURL: url, io: bookmarkRenewalIO) { onBookmarkRenewal(renewal) }
             } catch {}
         }
 
         return .available(url)
     }
 
-    @discardableResult
     private static func renewDatabaseBookmark(
-        _ bookmark: Data, expected: DatabaseReference, lease: PendingLocalSaveStore.CacheReadLease
-    ) -> Bool {
-        withStateLock {
-            guard let anchor = AppGroupContainer.resolvedURL else { return false }
+        _ bookmark: Data, expected: DatabaseReference, lease: PendingLocalSaveStore.CacheReadLease,
+        targetURL: URL, io: DurableFileWriteIO
+    ) -> DatabaseBookmarkRenewal? {
+        guard let anchor = AppGroupContainer.resolvedURL else { return nil }
+        do {
             var error: NSError?
-            var saved = false
-            NSFileCoordinator().coordinate(writingItemAt: databaseListURL, options: .forReplacing, error: &error) { registry in
+            var renewal: DatabaseBookmarkRenewal?
+            NSFileCoordinator().coordinate(readingItemAt: targetURL, options: [], writingItemAt: databaseListURL,
+                options: .forReplacing, error: &error) { target, registry in
+                guard stateLock.try() else { return }
+                defer { stateLock.unlock() }
                 do {
                     var references = try JSONDecoder().decode([DatabaseReference].self, from: Data(contentsOf: registry))
                     guard let index = references.firstIndex(where: { $0.id == expected.id }),
-                          !references[index].isCloudBacked, references[index].bookmarkData == expected.bookmarkData,
-                          references[index].lastMasterKeyChangeAt == expected.lastMasterKeyChangeAt else { return }
+                          !references[index].isCloudBacked, references[index] == expected else { return }
+                    let identity = try PendingLocalSaveStore.targetIdentity(at: target)
                     try PendingLocalSaveStore.withReferenceEpochAuthorization(lease) {
                         references[index].bookmarkData = bookmark
                         let encoder = JSONEncoder()
                         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-                        if case .durable = writeWithDurabilityOutcome(try encoder.encode(references), to: registry, directoryAnchor: anchor) { saved = true }
+                        if case .durable = writeWithDurabilityOutcome(try encoder.encode(references), to: registry,
+                            directoryAnchor: anchor, io: io) {
+                            renewal = DatabaseBookmarkRenewal(before: expected, after: references[index], epochID: lease.epochID, target: identity)
+                        }
                     }
                 } catch {}
             }
-            return saved && error == nil
+            return error == nil ? renewal : nil
         }
     }
 
-    static func resolveDatabaseURL(for reference: DatabaseReference) -> URL? {
-        guard case .available(let url) = locateDatabaseFile(for: reference) else {
+    static func resolveDatabaseURL(for reference: DatabaseReference, renewBookmark: Bool = true,
+        onBookmarkRenewal: (DatabaseBookmarkRenewal) -> Void = { _ in }
+    ) -> URL? {
+        guard case .available(let url) = locateDatabaseFile(for: reference, renewBookmark: renewBookmark, onBookmarkRenewal: onBookmarkRenewal) else {
             return nil
         }
         return url
@@ -1338,10 +1492,16 @@ enum DatabaseListStore {
         return relinked
     }
 
-    static func resolveKeyFileURL(for reference: DatabaseReference) -> URL? {
+    static func resolveKeyFileURL(
+        for reference: DatabaseReference,
+        onRenewal: (Task<KeyFilePreferenceOutcome, Never>) -> Void = { _ in }
+    ) -> URL? {
         guard let bookmark = reference.keyFileBookmarkData,
               let resolved = SecurityScopedBookmarkManager.resolveURL(from: bookmark) else { return nil }
-        if resolved.isStale { Task.detached(priority: .utility) { _ = renewKeyFileBookmark(for: reference) } }
+        if resolved.isStale {
+            let renewal = Task.detached(priority: .utility) { renewKeyFileBookmark(for: reference) }
+            onRenewal(renewal)
+        }
         return resolved.url
     }
 

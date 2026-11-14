@@ -145,8 +145,8 @@ final class DatabaseListViewModelTests: XCTestCase {
                 XCTAssertEqual(settled.keyEvidence?.association.filename, setup.secondKeyURL.lastPathComponent)
                 let stored = try XCTUnwrap(DatabaseListStore.databases.first { $0.id == setup.reference.id })
                 XCTAssertEqual(stored.keyFileFilename, setup.secondKeyURL.lastPathComponent)
-                let restarted = DatabaseViewModel(databaseReference: stored, quickUnlockKeyPersistOperation: { _, _, _ in false })
-                await restarted.unlock(password: "preference epoch key")
+                let restarted = DatabaseViewModel(databaseReference: stored, localReadKeyPersistOperation: { _, _, _ in false })
+                await restarted.unlock(password: "preference epoch key", keyFileData: setup.keyFileData)
                 XCTAssertEqual(restarted.state, .unlocked)
                 restarted.lock()
                 XCTAssertEqual(DatabaseListStore.databases.first { $0.id == stored.id }?.keyFileFilename, setup.secondKeyURL.lastPathComponent)
@@ -166,21 +166,27 @@ final class DatabaseListViewModelTests: XCTestCase {
                 return try await Task.detached { try SecurityScopedBookmarkManager.makeBookmarkData(for: url, readOnly: true) }.value
             })
             let pending = Task { try await firstWindow.setKeyFile(url: setup.firstKeyURL, for: setup.reference) }
-            await gate.firstCallStarted()
-            if newer == "selection" { try await DatabaseListViewModel().setKeyFile(url: setup.secondKeyURL, for: setup.reference) }
-            else if newer == "rekey" {
-                try await setup.database.changeMasterKey(newPassword: "a later epoch", newKeyFileData: setup.keyFileData,
-                    newKeyFileBookmarkData: setup.reference.keyFileBookmarkData, newKeyFileFilename: setup.reference.keyFileFilename)
-            } else { XCTAssertTrue(DatabaseListStore.remove(id: setup.reference.id)) }
-            let currentRegistry = try Data(contentsOf: AppGroupContainer.url.appendingPathComponent("database-list.json"))
-            let version = try PendingLocalSaveStore.recovery(for: setup.reference.id).associationVersion
-            await gate.releaseFirstCall()
-            do { try await pending.value; XCTFail("Stale select must be rejected") }
-            catch { XCTAssertTrue(error is DatabaseListStore.KeyFilePreferenceError) }
-            XCTAssertEqual(try Data(contentsOf: AppGroupContainer.url.appendingPathComponent("database-list.json")), currentRegistry)
-            XCTAssertEqual(try PendingLocalSaveStore.recovery(for: setup.reference.id).associationVersion, version)
-            XCTAssertEqual(setup.effects.withLock { $0.encryptions }, newer == "rekey" ? 2 : 1)
-            XCTAssertEqual(setup.effects.withLock { $0.providers }, 0)
+            do {
+                try await gate.firstCallStarted(for: pending)
+                if newer == "selection" { try await DatabaseListViewModel().setKeyFile(url: setup.secondKeyURL, for: setup.reference) }
+                else if newer == "rekey" {
+                    try await setup.database.changeMasterKey(newPassword: "a later epoch", newKeyFileData: setup.keyFileData,
+                        newKeyFileBookmarkData: setup.reference.keyFileBookmarkData, newKeyFileFilename: setup.reference.keyFileFilename)
+                } else { XCTAssertTrue(DatabaseListStore.remove(id: setup.reference.id)) }
+                let currentRegistry = try Data(contentsOf: AppGroupContainer.url.appendingPathComponent("database-list.json"))
+                let version = try PendingLocalSaveStore.recovery(for: setup.reference.id).associationVersion
+                await gate.releaseFirstCall()
+                do { try await pending.value; XCTFail("Stale select must be rejected") }
+                catch { XCTAssertTrue(error is DatabaseListStore.KeyFilePreferenceError) }
+                XCTAssertEqual(try Data(contentsOf: AppGroupContainer.url.appendingPathComponent("database-list.json")), currentRegistry)
+                XCTAssertEqual(try PendingLocalSaveStore.recovery(for: setup.reference.id).associationVersion, version)
+                XCTAssertEqual(setup.effects.withLock { $0.encryptions }, newer == "rekey" ? 2 : 1)
+                XCTAssertEqual(setup.effects.withLock { $0.providers }, 0)
+            } catch {
+                await gate.releaseFirstCall()
+                _ = await pending.result
+                throw error
+            }
         }
     }
 
@@ -234,20 +240,26 @@ final class DatabaseListViewModelTests: XCTestCase {
             return try await Task.detached { try SecurityScopedBookmarkManager.makeBookmarkData(for: url, readOnly: true) }.value
         })
         let first = Task { try await preferences.setKeyFile(url: setup.firstKeyURL, for: setup.reference) }
-        await gate.firstCallStarted()
-        preferences.cancelKeyFilePreference(for: setup.reference.id)
-        XCTAssertFalse(preferences.isChangingKeyFile(for: setup.reference.id))
-        first.cancel()
-        try await preferences.setKeyFile(url: setup.secondKeyURL, for: setup.reference)
-        let stored = try XCTUnwrap(DatabaseListStore.databases.first { $0.id == setup.reference.id })
-        await gate.releaseFirstCall()
-        do { try await first.value; XCTFail("Cancelled selection must not publish") }
-        catch { XCTAssertTrue(error is CancellationError) }
-        XCTAssertEqual(DatabaseListStore.databases.first { $0.id == stored.id }?.keyFileBookmarkData, stored.keyFileBookmarkData)
-        XCTAssertEqual(stored.keyFileFilename, setup.secondKeyURL.lastPathComponent)
-        XCTAssertFalse(preferences.isChangingKeyFile(for: stored.id))
-        XCTAssertNil(try PendingLocalSaveStore.recovery(for: stored.id).preferenceIntent)
-        XCTAssertEqual(setup.effects.withLock { $0.encryptions }, 1)
+        do {
+            try await gate.firstCallStarted(for: first)
+            preferences.cancelKeyFilePreference(for: setup.reference.id)
+            XCTAssertFalse(preferences.isChangingKeyFile(for: setup.reference.id))
+            first.cancel()
+            try await preferences.setKeyFile(url: setup.secondKeyURL, for: setup.reference)
+            let stored = try XCTUnwrap(DatabaseListStore.databases.first { $0.id == setup.reference.id })
+            await gate.releaseFirstCall()
+            do { try await first.value; XCTFail("Cancelled selection must not publish") }
+            catch { XCTAssertTrue(error is CancellationError) }
+            XCTAssertEqual(DatabaseListStore.databases.first { $0.id == stored.id }?.keyFileBookmarkData, stored.keyFileBookmarkData)
+            XCTAssertEqual(stored.keyFileFilename, setup.secondKeyURL.lastPathComponent)
+            XCTAssertFalse(preferences.isChangingKeyFile(for: stored.id))
+            XCTAssertNil(try PendingLocalSaveStore.recovery(for: stored.id).preferenceIntent)
+            XCTAssertEqual(setup.effects.withLock { $0.encryptions }, 1)
+        } catch {
+            await gate.releaseFirstCall()
+            _ = await first.result
+            throw error
+        }
     }
 
     func testPreferenceRejectsAnActiveSourceAdmissionAndLegacySelectionInventsNoEpoch() async throws {
@@ -264,7 +276,8 @@ final class DatabaseListViewModelTests: XCTestCase {
         XCTAssertEqual(afterPreference.receipts, beforePreference.receipts)
         XCTAssertEqual(afterPreference.keyEvidence?.targetState, beforePreference.keyEvidence?.targetState)
         XCTAssertEqual(afterPreference.keyEvidence?.epochID, beforePreference.keyEvidence?.epochID)
-        XCTAssertEqual(PendingLocalSaveStore.saves(for: setup.reference.id).map(\.fileURL), [prepared.save.fileURL])
+        XCTAssertEqual(try PendingLocalSaveStore.saves(for: setup.reference.id).map { try PendingLocalSaveStore.targetIdentity(at: $0.fileURL) },
+            [try PendingLocalSaveStore.targetIdentity(at: prepared.save.fileURL)])
         XCTAssertEqual(try Data(contentsOf: prepared.save.fileURL), bytes)
         let admission = try PendingLocalSaveStore.admit([prepared.receipt], for: setup.reference.id,
             target: LocalDatabaseSaver.captureTarget(for: setup.reference), baseline: FileDigest.sha512(bytes),
@@ -304,22 +317,26 @@ final class DatabaseListViewModelTests: XCTestCase {
         let database = DatabaseViewModel(databaseReference: reference, localSaveOperation: { draft, ref, key, hash, reconciled, newKey, settings in
             if newKey != nil { effects.withLock { $0.rekeys += 1 } }
             var environment = live
+            environment.localPublicationFailure = { stage, error in
+                TestDatabaseSupport.reportLocalPublicationFailure("preference-" + stage, error, reference: ref)
+            }
             environment.encryptDraft = { draft, key, header, policy in
                 effects.withLock { $0.encryptions += 1 }; return try live.encryptDraft(draft, key, header, policy)
             }
-            if denyTargetDirectorySync {
-                environment.replaceFileAtomically = { data, target, baseline, authorization in
-                    var io = LocalDatabaseSaver.ReplacementIO()
-                    io.synchronize = { _ in throw POSIXError(.EACCES) }
-                    return try LocalDatabaseSaver.replaceFileAtomically(data, at: target, expectedSHA512: baseline, authorization: authorization, io: io)
+            environment.replaceFileAtomically = { data, target, baseline, authorization in
+                var io = LocalDatabaseSaver.ReplacementIO()
+                io.observedFailure = { stage, error in
+                    TestDatabaseSupport.reportLocalPublicationFailure("preference-replacement-" + stage, error, reference: ref)
                 }
+                if denyTargetDirectorySync { io.synchronize = { _ in throw POSIXError(.EACCES) } }
+                return try LocalDatabaseSaver.replaceFileAtomically(data, at: target, expectedSHA512: baseline, authorization: authorization, io: io)
             }
             return try await LocalDatabaseSaver.save(draft: draft, reference: ref, compositeKey: key,
                 openTimeSHA512: hash, reconciledRemoteSHA512: reconciled, kdfPolicy: .mainApp,
                 newCompositeKey: newKey, encryptionSettings: settings, environment: environment)
         }, cloudSaveOperation: { _, _, _, _, _, _, _, _ in
             effects.withLock { $0.providers += 1 }; throw SaveError.saveContextUnavailable
-        }, quickUnlockKeyPersistOperation: { _, _, _ in false }, storedKeyPresenceCheck: { _ in false })
+        }, localReadKeyPersistOperation: { _, _, _ in false }, storedKeyPresenceCheck: { _ in false })
         await database.unlock(password: fixture.password)
         do {
             try await database.changeMasterKey(newPassword: "preference epoch key", newKeyFileData: keyFileData,

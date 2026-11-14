@@ -752,11 +752,13 @@ final class LocalDatabaseSaverTests: XCTestCase {
             entryTitle: "Twofish Saved Entry"
         )
 
+        var environment = LocalDatabaseSaver.Environment.live
+        environment.cacheDatabaseCopy = { try TestDatabaseSupport.cacheLocalSnapshotDiagnosingFailure($0, for: $1) }
         _ = try await LocalDatabaseSaver.save(
             draft: context.draft,
             reference: reference,
             compositeKey: context.compositeKey,
-            openTimeSHA512: context.openTimeSHA512
+            openTimeSHA512: context.openTimeSHA512, environment: environment
         )
 
         let savedData = try Data(contentsOf: databaseURL)
@@ -933,10 +935,9 @@ final class LocalDatabaseSaverTests: XCTestCase {
         )
         let cacheWrites = WriteCounter()
         var environment = LocalDatabaseSaver.Environment.live
-        let liveCacheCopy = environment.cacheDatabaseCopy
         environment.cacheDatabaseCopy = { data, reference in
             cacheWrites.increment()
-            try liveCacheCopy(data, reference)
+            try TestDatabaseSupport.cacheLocalSnapshotDiagnosingFailure(data, for: reference)
         }
 
         _ = try await LocalDatabaseSaver.save(
@@ -967,6 +968,11 @@ final class LocalDatabaseSaverTests: XCTestCase {
             entryTitle: "Uncached Entry"
         )
         var environment = LocalDatabaseSaver.Environment.live
+        environment.localPublicationFailure = { stage, error in
+            if stage.hasPrefix("invalidate-") {
+                TestDatabaseSupport.reportLocalPublicationFailure(stage, error, reference: reference)
+            }
+        }
         environment.cacheDatabaseCopy = { _, _ in
             throw CocoaError(.fileWriteOutOfSpace)
         }
@@ -1097,10 +1103,9 @@ final class LocalDatabaseSaverTests: XCTestCase {
             }
             return try liveReplace(data, url, expectedSHA512, authorization)
         }
-        let liveCacheCopy = environment.cacheDatabaseCopy
         environment.cacheDatabaseCopy = { data, reference in
             cacheWrites.increment()
-            try liveCacheCopy(data, reference)
+            try TestDatabaseSupport.cacheLocalSnapshotDiagnosingFailure(data, for: reference)
         }
 
         let result = try await LocalDatabaseSaver.save(
@@ -1123,7 +1128,7 @@ final class LocalDatabaseSaverTests: XCTestCase {
         XCTAssertEqual(FileDigest.sha512(try Data(contentsOf: cacheURL)), newSHA512)
     }
 
-    func testSaveFinishingWhileAnotherEncryptsConflictsInsteadOfOverwritingIt() async throws {
+    func testSaveFinishingAfterAnotherCapturedBaselineConflictsInsteadOfOverwritingIt() async throws {
         let databaseURL = try makeScratchDatabaseCopy()
         let reference = try makeRegisteredReference(for: databaseURL)
         let pausedContext = try makeDirtySaveContext(databaseURL: databaseURL, entryTitle: "Paused Writer Entry")
@@ -1132,11 +1137,11 @@ final class LocalDatabaseSaverTests: XCTestCase {
         let pausedWriterEncrypted = DispatchSemaphore(value: 0)
         let resumePausedWriter = DispatchSemaphore(value: 0)
         var pausedEnvironment = LocalDatabaseSaver.Environment.live
-        let liveEncrypt = pausedEnvironment.encryptDraft
-        pausedEnvironment.encryptDraft = { draft, compositeKey, header, kdfPolicy in
-            let data = try liveEncrypt(draft, compositeKey, header, kdfPolicy)
+        let liveRead = pausedEnvironment.readData
+        pausedEnvironment.readData = { url in
+            let data = try liveRead(url)
             pausedWriterEncrypted.signal()
-            resumePausedWriter.wait()
+            guard resumePausedWriter.wait(timeout: .now() + 30) == .success else { throw CocoaError(.userCancelled) }
             return data
         }
 
@@ -1150,20 +1155,23 @@ final class LocalDatabaseSaverTests: XCTestCase {
                 environment: pausedEnvironment
             )
         }
-        await withCheckedContinuation { continuation in
-            DispatchQueue.global().async {
-                pausedWriterEncrypted.wait()
-                continuation.resume()
-            }
-        }
-
-        let finishingResult = try await LocalDatabaseSaver.save(
+        let waitForEntry: @Sendable () -> DispatchTimeoutResult = { pausedWriterEncrypted.wait(timeout: .now() + 15) }
+        let entered = await Task.detached { waitForEntry() }.value
+        XCTAssertEqual(entered, .success)
+        let finishingResult: SaveResult
+        do {
+            finishingResult = try await LocalDatabaseSaver.save(
             draft: finishingContext.draft,
             reference: reference,
             compositeKey: finishingContext.compositeKey,
             openTimeSHA512: finishingContext.openTimeSHA512,
             kdfPolicy: .mainApp
         )
+        } catch {
+            resumePausedWriter.signal()
+            _ = try? await pausedSave.value
+            throw error
+        }
         resumePausedWriter.signal()
         let pausedResult = try await pausedSave.value
 
@@ -1181,6 +1189,56 @@ final class LocalDatabaseSaverTests: XCTestCase {
             .allEntries.map(\.title)
         XCTAssertTrue(titles.contains("Finishing Writer Entry"))
         XCTAssertFalse(titles.contains("Paused Writer Entry"))
+    }
+
+    func testAdmittedEncryptingSaverExcludesAnotherSaveAndStillRefusesExternalReplacement() async throws {
+        let url = try makeScratchDatabaseCopy()
+        let reference = try makeRegisteredReference(for: url)
+        let paused = try makeDirtySaveContext(databaseURL: url, entryTitle: "Paused writer")
+        let external = try makeDirtySaveContext(databaseURL: url, entryTitle: "External writer")
+        let ready = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        var environment = LocalDatabaseSaver.Environment.live
+        let live = environment
+        environment.encryptDraft = { draft, key, header, policy in
+            let output = try live.encryptDraft(draft, key, header, policy)
+            ready.signal()
+            guard release.wait(timeout: .now() + 30) == .success else { throw CocoaError(.userCancelled) }
+            return output
+        }
+        let worker = Task { try await LocalDatabaseSaver.save(draft: paused.draft, reference: reference,
+            compositeKey: paused.compositeKey, openTimeSHA512: paused.openTimeSHA512, environment: environment) }
+        let waitForEntry: @Sendable () -> DispatchTimeoutResult = { ready.wait(timeout: .now() + 15) }
+        let entered = await Task.detached { waitForEntry() }.value
+        XCTAssertEqual(entered, .success)
+        let installed: Data
+        do {
+            var contender = live
+            contender.encryptDraft = { _, _, _, _ in XCTFail("An owned admission must reject before a second encryption"); throw CocoaError(.userCancelled) }
+            do { _ = try await LocalDatabaseSaver.save(draft: external.draft, reference: reference,
+                compositeKey: external.compositeKey, openTimeSHA512: external.openTimeSHA512, environment: contender)
+                XCTFail("A second local admission cannot pass an encrypting owner")
+            } catch { XCTAssertTrue(error is LocalSaveBeforeReplacementFailure) }
+            installed = try await Task.detached {
+                let original = try Data(contentsOf: url)
+                let header = try live.extractHeader(original, external.compositeKey, .mainApp)
+                let bytes = try live.encryptDraft(external.draft, external.compositeKey, header, .mainApp).data
+                let outcome = try LocalDatabaseSaver.replaceFileAtomically(bytes, at: url, expectedSHA512: external.openTimeSHA512)
+                guard case .replaced = outcome else { throw CocoaError(.fileWriteUnknown) }
+                return bytes
+            }.value
+        } catch {
+            release.signal()
+            _ = try? await worker.value
+            throw error
+        }
+        release.signal()
+        let result = try await worker.value
+        guard case .conflict(let sha, let bytes) = result else { return XCTFail("Final replacement must reject an external coordinated writer") }
+        XCTAssertEqual(bytes, installed)
+        XCTAssertEqual(sha, FileDigest.sha512(installed))
+        XCTAssertEqual(try Data(contentsOf: url), installed)
+        XCTAssertFalse(PendingLocalSaveStore.hasSaves(for: reference.id))
     }
 
     func testSaveRemoteChangedSinceOpenReturnsConflictDoesNotWrite() async throws {
@@ -1262,6 +1320,279 @@ final class LocalDatabaseSaverTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: databaseURL), strangerData)
     }
 
+    func testBookmarkRenewalDuringResolutionCannotSilentlyUpgradeACapturedReadOrCacheLease() throws {
+        let oldURL = try makeScratchDatabaseCopy()
+        let reference = try makeRegisteredReference(for: oldURL)
+        let bytes = try Data(contentsOf: oldURL)
+        let lease = try PendingLocalSaveStore.captureCacheReadLease(for: reference)
+        let cache = DatabaseListStore.cacheLocation(for: reference)
+        try DatabaseListStore.cacheDatabaseCopy(bytes, for: reference)
+        let renamed = oldURL.deletingLastPathComponent().appendingPathComponent("renewed-bookmark.kdbx")
+        try FileManager.default.moveItem(at: oldURL, to: renamed)
+        let resolved = DatabaseListStore.locateDatabaseFile(for: reference, resolveBookmark: { _ in (renamed, true) })
+        guard case .available(let actual)? = resolved else { return XCTFail("Controlled stale resolution must remain readable") }
+        let current = try XCTUnwrap(DatabaseListStore.databases.first { $0.id == reference.id })
+        XCTAssertNotEqual(current.bookmarkData, reference.bookmarkData, "The control needs a real field-specific renewal")
+        XCTAssertEqual(current.lastMasterKeyChangeAt, reference.lastMasterKeyChangeAt)
+        XCTAssertEqual(current.keyFileBookmarkData, reference.keyFileBookmarkData)
+        let read = PendingLocalSaveStore.ReadKeyPublication(lease: lease,
+            target: try PendingLocalSaveStore.targetIdentity(at: actual), sha512: FileDigest.sha512(bytes), sharedCopy: false, encryptedSnapshot: bytes)
+        var keysPublished = false
+        XCTAssertThrowsError(try DatabaseListStore.withLocalReadKeyPublication(for: reference, read: read,
+            permit: .init(actionID: UUID(), lockCycleID: 0)) { keysPublished = true })
+        XCTAssertFalse(keysPublished)
+        XCTAssertThrowsError(try LocalDatabaseSaver.cacheLocalSnapshot(bytes, for: reference, lease: lease)) { error in
+            XCTAssertEqual(error as? PendingLocalSaveStore.OwnershipError, .sourceChanged)
+        }
+        XCTAssertEqual(try Data(contentsOf: cache), bytes)
+        XCTAssertEqual(try Data(contentsOf: renamed), bytes)
+    }
+
+    private func makeRenewedSnapshot(io: DurableFileWriteIO = .init(), initializeEpoch: Bool = false) throws -> (
+        reference: DatabaseReference, lease: PendingLocalSaveStore.CacheReadLease, url: URL, bytes: Data,
+        renewal: DatabaseListStore.DatabaseBookmarkRenewal?
+    ) {
+        let source = try makeScratchDatabaseCopy()
+        let reference = try makeRegisteredReference(for: source)
+        if initializeEpoch {
+            let token = try PendingLocalSaveStore.admit([], for: reference.id,
+                target: PendingLocalSaveStore.targetIdentity(at: source), baseline: FileDigest.sha512(Data(contentsOf: source)),
+                masterKeyChangedAt: reference.lastMasterKeyChangeAt, purpose: .ordinarySave)
+            XCTAssertEqual(PendingLocalSaveStore.releaseAfterProvenNoReplacement(token), .resolved)
+        }
+        let lease = try PendingLocalSaveStore.captureCacheReadLease(for: reference)
+        let bytes = try Data(contentsOf: source)
+        let moved = source.deletingLastPathComponent().appendingPathComponent("renewal-\(UUID().uuidString).kdbx")
+        try FileManager.default.moveItem(at: source, to: moved)
+        var renewal: DatabaseListStore.DatabaseBookmarkRenewal?
+        guard case .available? = DatabaseListStore.locateDatabaseFile(for: reference,
+            resolveBookmark: { _ in (moved, true) }, bookmarkRenewalIO: io,
+            onBookmarkRenewal: { renewal = $0 }) else { throw SaveError.databaseLocationUnavailable }
+        return (reference, lease, moved, bytes, renewal)
+    }
+
+    func testKnownSaveCachesItsExactInstalledTargetWithoutRenewingDuringEpochInitialization() async throws {
+        let old = try makeScratchDatabaseCopy()
+        let reference = try makeRegisteredReference(for: old)
+        let moved = old.deletingLastPathComponent().appendingPathComponent("write-after-move.kdbx")
+        try FileManager.default.moveItem(at: old, to: moved)
+        let context = try makeDirtySaveContext(databaseURL: moved, entryTitle: "Installed Once After Move")
+        let counts = OSAllocatedUnfairLock(initialState: (encryptions: 0, replacements: 0, renewals: 0))
+        let trace = TestDatabaseSupport.LocalPublicationTrace()
+        let live = LocalDatabaseSaver.Environment.live
+        var environment = live
+        environment.localPublicationFailure = { trace.record($0, $1) }
+        environment.resolveLocation = { ref in
+            guard case .available(let url)? = DatabaseListStore.locateDatabaseFile(for: ref,
+                resolveBookmark: { _ in (moved, true) }, renewBookmark: false,
+                onBookmarkRenewal: { _ in counts.withLock { $0.renewals += 1 } }) else { return nil }
+            return .init(url: url, usesSecurityScope: false)
+        }
+        environment.encryptDraft = { draft, key, header, policy in
+            counts.withLock { $0.encryptions += 1 }
+            return try live.encryptDraft(draft, key, header, policy)
+        }
+        environment.replaceFileAtomically = { data, url, baseline, authorization in
+            counts.withLock { $0.replacements += 1 }
+            var io = LocalDatabaseSaver.ReplacementIO()
+            io.observedFailure = { trace.record("replacement-" + $0, $1) }
+            return try LocalDatabaseSaver.replaceFileAtomically(data, at: url, expectedSHA512: baseline,
+                authorization: authorization, io: io)
+        }
+        let result = try await LocalDatabaseSaver.save(draft: context.draft, reference: reference,
+            compositeKey: context.compositeKey, openTimeSHA512: context.openTimeSHA512, environment: environment)
+        guard case .saved(let sha, _, let receipt) = result else {
+            let effects = counts.withLock { $0 }
+            return XCTFail("Expected a known durable save; actual=\(saveOutcomeDescription(result)) crypto=\(effects.encryptions) replace=\(effects.replacements) renewals=\(effects.renewals) capturedTargetExists=\(FileManager.default.fileExists(atPath: moved.path)) boundaries=\(trace.summary)")
+        }
+        let installed = try Data(contentsOf: moved)
+        XCTAssertEqual(sha, FileDigest.sha512(installed))
+        XCTAssertEqual(receipt?.encryptedSnapshot, installed)
+        XCTAssertEqual(try Data(contentsOf: DatabaseListStore.cacheLocation(for: reference)), installed)
+        XCTAssertEqual(DatabaseListStore.databases.first { $0.id == reference.id }?.bookmarkData, reference.bookmarkData)
+        XCTAssertEqual(counts.withLock { $0.encryptions }, 1)
+        XCTAssertEqual(counts.withLock { $0.replacements }, 1)
+        XCTAssertEqual(counts.withLock { $0.renewals }, 0)
+        let opened = try KDBXParser.parse(data: installed, compositeKey: context.compositeKey,
+            sessionKey: context.draft.writerSessionKey, kdfPolicy: .mainApp)
+        XCTAssertTrue(opened.rootGroup.allEntries.contains { $0.title == "Installed Once After Move" })
+    }
+
+    func testDurableBookmarkRenewalPublishesOnlyItsAuthenticatedSnapshotThroughTheRealFences() async throws {
+        let setup = try makeRenewedSnapshot()
+        let renewal = try XCTUnwrap(setup.renewal)
+        let key = KDBXCrypto.compositeKey(password: fixturePassword)
+        _ = try KDBXParser.parse(data: setup.bytes, compositeKey: key, sessionKey: SymmetricKey(size: .bits256), kdfPolicy: .mainApp)
+        var lease = setup.lease
+        lease.bookmarkRenewal = renewal
+        let read = PendingLocalSaveStore.ReadKeyPublication(lease: lease,
+            target: try PendingLocalSaveStore.targetIdentity(at: setup.url), sha512: FileDigest.sha512(setup.bytes),
+            sharedCopy: false, encryptedSnapshot: setup.bytes)
+        let effects = OSAllocatedUnfairLock(initialState: 0)
+        try await Task.detached {
+            _ = try DatabaseListStore.withLocalReadKeyPublication(for: setup.reference, read: read,
+                permit: .init(actionID: UUID(), lockCycleID: 0)) { effects.withLock { $0 += 1 } }
+            try LocalDatabaseSaver.cacheLocalSnapshot(setup.bytes, for: setup.reference, lease: lease)
+        }.value
+        XCTAssertEqual(effects.withLock { $0 }, 1)
+        XCTAssertEqual(try Data(contentsOf: DatabaseListStore.cacheLocation(for: setup.reference)), setup.bytes)
+        XCTAssertEqual(try Data(contentsOf: setup.url), setup.bytes)
+        XCTAssertEqual(DatabaseListStore.databases.first { $0.id == setup.reference.id }, renewal.after)
+    }
+
+    func testRenewalCannotPublishAcrossTargetAuthorityOwnershipOrPermissionChanges() async throws {
+        for change in ["inode", "ciphertext", "factors", "master-key-date", "hardware", "source", "provisional", "owner-unreadable", "admission", "retirement", "removal", "foreign-receipt", "closed"] {
+            let setup = try makeRenewedSnapshot(initializeEpoch: true)
+            var lease = setup.lease
+            lease.bookmarkRenewal = try XCTUnwrap(setup.renewal)
+            let target = try PendingLocalSaveStore.targetIdentity(at: setup.url)
+            let readBytes = setup.bytes
+            var current = try XCTUnwrap(DatabaseListStore.databases.first { $0.id == setup.reference.id })
+            switch change {
+            case "inode": try readBytes.write(to: setup.url, options: .atomic)
+            case "ciphertext":
+                let handle = try FileHandle(forWritingTo: setup.url)
+                try handle.write(contentsOf: Data(repeating: 0xA1, count: readBytes.count))
+                try handle.close()
+                XCTAssertEqual(try PendingLocalSaveStore.targetIdentity(at: setup.url), target)
+            case "factors": current.keyFileFilename = "different.keyx"; current.keyFileBookmarkData = Data([0x74]); DatabaseListStore.update(current)
+            case "master-key-date": current.lastMasterKeyChangeAt = .now; DatabaseListStore.update(current)
+            case "hardware": current.hardwareKey = HardwareKeyConfiguration(transport: .nfc, slot: .two); DatabaseListStore.update(current)
+            case "source":
+                let prepared = try PendingLocalSaveStore.prepareSource(readBytes, for: current.id,
+                    masterKeyChangedAt: current.lastMasterKeyChangeAt, baseCacheSHA512: FileDigest.sha512(readBytes))
+                try writeAtomicallyAndDurably(readBytes, to: PendingLocalSaveStore.sharedCopyURL(for: current.id), directoryAnchor: AppGroupContainer.url)
+                XCTAssertEqual(PendingLocalSaveStore.activateSource(prepared), .accepted)
+            case "provisional":
+                _ = try PendingLocalSaveStore.prepareSource(readBytes, for: current.id,
+                    masterKeyChangedAt: current.lastMasterKeyChangeAt, baseCacheSHA512: FileDigest.sha512(readBytes))
+            case "owner-unreadable":
+                let owner = AppGroupContainer.url.appendingPathComponent("pending-local-save-owners/\(current.id.uuidString)/owner.json")
+                try FileManager.default.removeItem(at: owner)
+                try FileManager.default.createDirectory(at: owner, withIntermediateDirectories: false)
+                XCTAssertThrowsError(try Data(contentsOf: owner))
+            case "admission":
+                _ = try PendingLocalSaveStore.admit([], for: current.id, target: target, baseline: FileDigest.sha512(readBytes),
+                    masterKeyChangedAt: current.lastMasterKeyChangeAt, purpose: .ordinarySave)
+            case "retirement":
+                let writes = WriteCounter()
+                var storage = PendingLocalSaveStore.StorageIO()
+                storage.fileIO = { _ in
+                    writes.increment()
+                    var writer = DurableFileWriteIO()
+                    if writes.count == 2 { writer.write = { _, _, _ in 0 } }
+                    return writer
+                }
+                XCTAssertEqual(try PendingLocalSaveStore.discard(PendingLocalSaveStore.recovery(for: current.id), io: storage), .retainedForRecovery)
+                XCTAssertNotNil(try PendingLocalSaveStore.recovery(for: current.id).retirementID)
+            case "removal": DatabaseListStore.remove(id: current.id)
+            case "foreign-receipt": lease.bookmarkRenewal = try XCTUnwrap(makeRenewedSnapshot().renewal)
+            default: break
+            }
+            let read = PendingLocalSaveStore.ReadKeyPublication(lease: lease, target: target,
+                sha512: FileDigest.sha512(readBytes), sharedCopy: false, encryptedSnapshot: readBytes)
+            let permit = DatabaseListStore.KeyCommitPublicationPermit(actionID: UUID(), lockCycleID: 0)
+            if change == "closed" { permit.close() }
+            let effects = OSAllocatedUnfairLock(initialState: 0)
+            var io = DatabaseListStore.KeyCommitPublicationIO()
+            io.resolve = { _ in (setup.url, false) }
+            let publicationIO = io
+            do {
+                try await Task.detached {
+                    _ = try DatabaseListStore.withLocalReadKeyPublication(for: setup.reference, read: read, permit: permit, io: publicationIO) {
+                        effects.withLock { $0 += 1 }
+                    }
+                }.value
+                XCTFail("Changed \(change) must reject publication")
+            } catch {
+                if change == "owner-unreadable" { XCTAssertTrue(error is CocoaError, "\(change): \(error)") }
+                else { XCTAssertTrue(error is PendingLocalSaveStore.OwnershipError, "\(change): \(error)") }
+            }
+            XCTAssertEqual(effects.withLock { $0 }, 0, change)
+            if change != "closed" {
+                do {
+                    let reconciled = try await Task.detached {
+                        try DatabaseListStore.authenticatedBookmarkRenewalForMerge(for: setup.reference, read: read, io: publicationIO)
+                    }.value
+                    if change == "source" { XCTAssertEqual(reconciled, setup.renewal) }
+                    else { XCTFail("Changed \(change) must also reject bookmark-only reconciliation") }
+                } catch {
+                    XCTAssertNotEqual(change, "source", "Healthy sources permit only bookmark reconciliation: \(error)")
+                    XCTAssertTrue(error is PendingLocalSaveStore.OwnershipError || error is CocoaError, "\(change): \(error)")
+                }
+                XCTAssertThrowsError(try LocalDatabaseSaver.cacheLocalSnapshot(readBytes, for: setup.reference, lease: lease), change)
+            }
+        }
+    }
+
+    func testReadPublicationRejectsContendedListInsideAccessorWithoutWaitingOrWritingKeys() async throws {
+        let setup = try makeRenewedSnapshot()
+        var lease = setup.lease
+        lease.bookmarkRenewal = try XCTUnwrap(setup.renewal)
+        let current = try XCTUnwrap(setup.renewal).after
+        let read = PendingLocalSaveStore.ReadKeyPublication(lease: lease,
+            target: try PendingLocalSaveStore.targetIdentity(at: setup.url), sha512: FileDigest.sha512(setup.bytes),
+            sharedCopy: false, encryptedSnapshot: setup.bytes)
+        let coordinateEntered = expectation(description: "provider ready after short list snapshot")
+        let listEntered = expectation(description: "independent list holder entered")
+        let returned = expectation(description: "publication rejects before holder releases")
+        let holderReady = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        defer { release.signal(); holderReady.signal() }
+        let effects = OSAllocatedUnfairLock(initialState: 0)
+        let live = DatabaseListStore.KeyCommitPublicationIO()
+        var io = live
+        io.coordinate = { target, registry, accessor in
+            coordinateEntered.fulfill()
+            guard holderReady.wait(timeout: .now() + 15) == .success else { throw CancellationError() }
+            try live.coordinate(target, registry, accessor)
+        }
+        let publicationIO = io
+        let publication = Task.detached {
+            defer { returned.fulfill() }
+            return try DatabaseListStore.withLocalReadKeyPublication(for: setup.reference, read: read,
+                permit: .init(actionID: UUID(), lockCycleID: 0), io: publicationIO) { effects.withLock { $0 += 1 } }
+        }
+        await fulfillment(of: [coordinateEntered], timeout: 15)
+        let holder = Task.detached {
+            try DatabaseListStore.withLocalCacheReference(current, allowNewReference: false) {
+                listEntered.fulfill()
+                holderReady.signal()
+                XCTAssertEqual(release.wait(timeout: .now() + 15), .success)
+            }
+        }
+        await fulfillment(of: [listEntered, returned], timeout: 7)
+        release.signal()
+        _ = await holder.result
+        do { _ = try await publication.value; XCTFail("Contended list must reject without executing Keychain") }
+        catch { XCTAssertEqual(error as? PendingLocalSaveStore.OwnershipError, .recoveryRequired) }
+        XCTAssertEqual(effects.withLock { $0 }, 0)
+    }
+
+    func testUnpublishedAndVisibleUnconfirmedBookmarkRenewalsNeverMintAReceipt() throws {
+        for postPublication in [false, true] {
+            let published = OSAllocatedUnfairLock(initialState: false)
+            let live = DurableFileWriteIO()
+            var io = live
+            io.afterPublication = { _ in published.withLock { $0 = true } }
+            if postPublication {
+                io.synchronizeParent = { directory in
+                    if published.withLock({ $0 }) { throw POSIXError(.EIO) }
+                    try live.synchronizeParent(directory)
+                }
+            } else { io.write = { _, _, _ in 0 } }
+            let setup = try makeRenewedSnapshot(io: io)
+            XCTAssertEqual(published.withLock { $0 }, postPublication, "The post-publication fault must reach the actual rename")
+            XCTAssertNil(setup.renewal)
+            let current = try XCTUnwrap(DatabaseListStore.databases.first { $0.id == setup.reference.id })
+            if postPublication {
+                XCTAssertNotEqual(current.bookmarkData, setup.reference.bookmarkData)
+                XCTAssertThrowsError(try LocalDatabaseSaver.cacheLocalSnapshot(setup.bytes, for: setup.reference, lease: setup.lease))
+            } else { XCTAssertEqual(current, setup.reference) }
+            XCTAssertEqual(try Data(contentsOf: setup.url), setup.bytes)
+        }
+    }
+
     func testSaveOnReadOnlyFilesystemThrowsAndLeavesOriginalIntact() async throws {
         let databaseURL = try makeScratchDatabaseCopy()
         let directoryURL = databaseURL.deletingLastPathComponent()
@@ -1272,21 +1603,115 @@ final class LocalDatabaseSaverTests: XCTestCase {
             entryTitle: "Read Only FS Entry"
         )
 
+        let cache = DatabaseListStore.cacheLocation(for: reference)
+        try DatabaseListStore.cacheDatabaseCopy(originalData, for: reference)
+        defer {
+            XCTAssertEqual(try Data(contentsOf: databaseURL), originalData)
+            XCTAssertEqual(try Data(contentsOf: cache), originalData)
+        }
         try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: directoryURL.path)
         defer {
             try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directoryURL.path)
         }
 
+        let probe = directoryURL.appendingPathComponent("permission-control-\(UUID().uuidString)")
+        var bypassesWriteDenial = false
         do {
-            _ = try await LocalDatabaseSaver.save(
-                draft: context.draft,
-                reference: reference,
-                compositeKey: context.compositeKey,
-                openTimeSHA512: context.openTimeSHA512
-            )
-            XCTFail("Expected save to fail on a read-only filesystem.")
+            try Data("permission control".utf8).write(to: probe, options: .withoutOverwriting)
+            bypassesWriteDenial = true
+            try FileManager.default.removeItem(at: probe)
         } catch {
-            XCTAssertEqual(try Data(contentsOf: databaseURL), originalData)
+            let cocoa = error as NSError
+            guard (error as? CocoaError)?.code == .fileWriteNoPermission
+                || (cocoa.domain == NSPOSIXErrorDomain && cocoa.code == Int(EACCES)) else { throw error }
+        }
+        XCTAssertEqual(try Data(contentsOf: databaseURL), originalData)
+        if bypassesWriteDenial { throw XCTSkip("The independent directory-create control bypassed chmod write denial on this host") }
+
+        let observed = OSAllocatedUnfairLock(initialState: [String]())
+        let effects = OSAllocatedUnfairLock(initialState: (crypto: 0, replacement: 0))
+        let live = LocalDatabaseSaver.Environment.live
+        var environment = live
+        environment.encryptDraft = { draft, key, header, policy in
+            effects.withLock { $0.crypto += 1 }
+            return try live.encryptDraft(draft, key, header, policy)
+        }
+        environment.replaceFileAtomically = { data, target, baseline, authorization in
+            effects.withLock { $0.replacement += 1 }
+            var io = LocalDatabaseSaver.ReplacementIO()
+            io.observedFailure = { phase, error in
+                observed.withLock { $0.append("\(phase):\((error as NSError).domain):\((error as NSError).code)") }
+            }
+            return try LocalDatabaseSaver.replaceFileAtomically(data, at: target, expectedSHA512: baseline, authorization: authorization, io: io)
+        }
+        let first: Result<SaveResult, Error>
+        do {
+            first = .success(try await LocalDatabaseSaver.save(draft: context.draft, reference: reference,
+                compositeKey: context.compositeKey, openTimeSHA512: context.openTimeSHA512, environment: environment))
+        } catch { first = .failure(error) }
+        switch first {
+        case .success(let outcome):
+            guard case .indeterminate(let scope) = outcome else {
+                XCTFail("Read-only replacement must not claim success/conflict: \(saveOutcomeDescription(outcome)); observed=\(observed.withLock { $0 })")
+                break
+            }
+            XCTAssertEqual(scope, .databaseFile)
+            let admission = try XCTUnwrap(PendingLocalSaveStore.recovery(for: reference.id).admission)
+            XCTAssertEqual(admission.purpose, .ordinarySave)
+            XCTAssertTrue(admission.sources.isEmpty)
+            XCTAssertNil(admission.knownTarget)
+            XCTAssertTrue(observed.withLock { $0.contains { $0.hasPrefix("replacement:") } }, "No-effect is not inferred from the permission error's type")
+            XCTAssertEqual(effects.withLock { $0.crypto }, 1)
+            XCTAssertEqual(effects.withLock { $0.replacement }, 1)
+            do {
+                _ = try await LocalDatabaseSaver.save(draft: context.draft, reference: reference,
+                    compositeKey: context.compositeKey, openTimeSHA512: context.openTimeSHA512, environment: environment)
+                XCTFail("Uncertainty must reject a second invocation before encryption")
+            } catch { XCTAssertTrue(error is LocalSaveBeforeReplacementFailure) }
+            XCTAssertEqual(try PendingLocalSaveStore.recovery(for: reference.id).admission, admission)
+            XCTAssertEqual(effects.withLock { $0.crypto }, 1)
+            XCTAssertEqual(effects.withLock { $0.replacement }, 1)
+        case .failure(let error):
+            let observations = observed.withLock { $0 }
+            let counts = effects.withLock { $0 }
+            XCTAssertLessThanOrEqual(counts.crypto, 1, "A pre-replacement failure must not hide internal encryption retries")
+            XCTAssertLessThanOrEqual(counts.replacement, 1)
+            let replacementObserved = observations.contains { $0.hasPrefix("replacement:") }
+            XCTAssertFalse(replacementObserved, "An entered replacement MUST return indeterminate and retain admission, never a retryable wrapper")
+            let beforeReplacement = counts.replacement == 0 || observations.contains {
+                $0.hasPrefix("baseline:") || $0.hasPrefix("staging:") || $0.hasPrefix("owner:")
+            }
+            XCTAssertTrue(beforeReplacement && !replacementObserved,
+                "Thrown needs an observed pre-replacement phase; observed=\(observations)")
+            guard beforeReplacement && !replacementObserved else { break }
+            let failure = try XCTUnwrap(error as? LocalSaveBeforeReplacementFailure)
+            let recovery = try PendingLocalSaveStore.recovery(for: reference.id)
+            if failure.underlying is SavePreReplacementRecoveryWarning {
+                let admission = try XCTUnwrap(recovery.admission)
+                XCTAssertEqual(admission.purpose, .ordinarySave)
+                XCTAssertTrue(admission.sources.isEmpty)
+                XCTAssertNil(admission.knownTarget)
+                do {
+                    _ = try await LocalDatabaseSaver.save(draft: context.draft, reference: reference,
+                        compositeKey: context.compositeKey, openTimeSHA512: context.openTimeSHA512, environment: environment)
+                    XCTFail("Unresolved pre-replacement cleanup cannot retry encryption")
+                } catch { XCTAssertTrue(error is LocalSaveBeforeReplacementFailure) }
+                XCTAssertEqual(try PendingLocalSaveStore.recovery(for: reference.id).admission, admission)
+            } else {
+                XCTAssertNil(recovery.admission, "Affirmative pre-replacement failure must durably release its admission")
+                XCTAssertFalse(recovery.needsRecovery)
+            }
+            XCTAssertEqual(effects.withLock { $0.crypto }, counts.crypto)
+            XCTAssertEqual(effects.withLock { $0.replacement }, counts.replacement)
+        }
+    }
+
+    private func saveOutcomeDescription(_ result: SaveResult) -> String {
+        switch result {
+        case .saved: "saved"
+        case .conflict: "conflict"
+        case .indeterminate(let scope): "indeterminate/\(scope)"
+        case .committedWithoutConfirmedDurability(_, _, _, let scope): "committedWithoutConfirmedDurability/\(scope)"
         }
     }
 
