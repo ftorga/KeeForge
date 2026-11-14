@@ -494,7 +494,8 @@ final class DatabaseViewModelCloudSyncTests: XCTestCase {
 
     private func exerciseNotificationHandoff(externalContention: Bool) async throws {
         let base = try fixtureData()
-        let transport = CloudJournalTransport(remote: base, revision: "rev-A")
+        let transport = CloudJournalTransport(remote: base, revision: "rev-A",
+            metadataError: externalContention ? .networkUnavailable : nil)
         let leaseEntered = DispatchSemaphore(value: 0)
         let releaseLease = DispatchSemaphore(value: 0)
         let completed = XCTestExpectation(description: "real notification drain ended")
@@ -569,6 +570,7 @@ final class DatabaseViewModelCloudSyncTests: XCTestCase {
             XCTAssertEqual(notifications.value, 1)
             XCTAssertEqual(setup.encryptions.value, 1)
             XCTAssertEqual(setup.replacements.value, 1)
+            XCTAssertEqual(transport.effects.metadataCalls, 0, "Provider IO cannot run through the held lease")
             XCTAssertEqual(transport.effects.uploads.count, 0, "Provider dispatch cannot run through the held lease")
             releaseLease.signal()
             let joined = await XCTWaiter.fulfillment(of: [completed], timeout: 30)
@@ -577,6 +579,8 @@ final class DatabaseViewModelCloudSyncTests: XCTestCase {
             XCTAssertEqual(setup.encryptions.value, 1)
             XCTAssertEqual(setup.replacements.value, 1)
             if externalContention {
+                XCTAssertGreaterThan(transport.effects.metadataCalls, 0, "Retention must reach the scripted metadata failure after the lease releases")
+                XCTAssertEqual(transport.effects.downloads, 0)
                 XCTAssertEqual(transport.effects.uploads.count, 0)
                 XCTAssertEqual(try PendingUploadQueue.readJournal(for: setup.reference.id).count, 2)
             } else {
