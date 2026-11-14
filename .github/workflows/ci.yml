@@ -35,7 +35,7 @@ jobs:
       TEST_SUITE: '${{ matrix.suite }}'
       DESTINATION: '${{ matrix.destination }}'
       SOURCE_SHA: '${{ inputs.source_ref }}'
-      DIAGNOSTIC_SLICE: '${{ inputs.slice || 'local' }}'
+      DIAGNOSTIC_SLICE: '${{ inputs.slice }}'
     steps:
       - uses: actions/checkout@v7
         with:
@@ -112,7 +112,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: '${{ inputs.slice || 'local' }}-focused-${{ matrix.suite }}'
+          name: '${{ inputs.slice }}-focused-${{ matrix.suite }}'
           path: |
             build/*.txt
             build/*.json
