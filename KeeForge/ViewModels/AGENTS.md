@@ -123,3 +123,5 @@ Unit classes in `../../KeeForgeTests/` are named `<Type>Tests`. Cover success, f
 - Cloud open completion merges only learned sync fields against the exact pre-await observed metadata. It never writes a captured whole reference over a later rekey, local head or removal, and a rejected metadata CAS supplies no current-epoch authority to the old parsed ciphertext.
 
 - Explicit cloud reads with pending journals do not publish the remote snapshot or learned validators into the pending cache/reference. Sync Now exposes divergence to Merge; Reload retains the draft and requests that merge first. A remote byte baseline does not inherit the prior reference’s validators.
+
+- Explicit pending cloud merge and conflict merge authenticate source snapshots plus the remote before calling the saver once. Their RAM merge context is scoped to that awaited invocation and revoked by lock, cancellation or a new session. A durable installed merged owner may absorb only captured unchanged source identities; pending provider delivery still owns the resulting ciphertext. A rejected or unconfirmed handoff retains sources and exposes recovery, without an automatic second encryption.

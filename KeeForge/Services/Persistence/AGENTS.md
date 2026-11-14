@@ -118,3 +118,5 @@
 - A confirmed merge publishes only its installed target’s database bookmark through receipt/reference/owner CAS while the saver’s original grant is still active, then completes exact source retirement and cache refresh before returning. Its nonpersistent receipt carries that completion so the VM cannot re-resolve an inode-stale bookmark or repeat consumption. Bookmark publication uncertainty retains the admission and sources; no canonical receipt path substitutes for a grant.
 
 - Whole-store unit-test cleanup may remove retained cloud caches only in the redirected test App Group, after journal cleanup. Ordinary reference removal continues to refuse unresolved cloud ownership; the live container does not inherit that teardown authority.
+
+- The cloud merge caller may supply a synchronous replacement fence and captured cache lease to the existing writer. Its final coordinated accessor holds exact reference/source authority through local-owner validation and replacement; no callback awaits, performs KDF or acquires a waiting list lock. The local saver retains all ordinary replacement/outcome and revocation semantics.

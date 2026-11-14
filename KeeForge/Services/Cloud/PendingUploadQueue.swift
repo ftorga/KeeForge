@@ -559,34 +559,34 @@ enum PendingUploadQueue {
         return bytes
     }
 
-    static func transferMergedSources(_ sources: [StoredMarker], toPayloadSHA512 sha: Data, for databaseID: UUID, environment: Environment = .live) throws {
-        try withCommitLock(for: databaseID, environment: environment) {
-            guard var owner = try readJournal(for: databaseID, environment: environment).last(where: {
-                $0.marker.isPayloadFinalized == true && $0.marker.intendedPayloadSHA512 == sha && $0.marker.intendedPayloadPath != nil
-            }) else { throw SaveError.saveContextUnavailable }
-            guard let current = DatabaseListStore.databases.first(where: { $0.id == databaseID }),
-                  current.cloudSyncMetadata?.localHeadOperationID == owner.id,
-                  current.cloudSyncMetadata?.keyEpoch == owner.marker.keyEpoch,
-                  owner.marker.localCommitBaseline?.hasCompatibleEpoch(current) == true,
-                  FileDigest.sha512(try environment.readData(DatabaseListStore.cacheLocation(for: current))) == sha,
-                  let path = owner.marker.intendedPayloadPath,
-                  FileDigest.sha512(try environment.readData(resolveAppGroupURL(for: path, environment: environment))) == sha else {
+    /// Caller holds commit and reference authority through the exact source handoff.
+    static func transferMergedSourcesLocked(_ sources: [StoredMarker], toPayloadSHA512 sha: Data,
+        reference current: DatabaseReference, environment: Environment = .live) throws {
+        let databaseID = current.id
+        guard var owner = try readJournal(for: databaseID, environment: environment).last(where: {
+            $0.marker.isPayloadFinalized == true && $0.marker.intendedPayloadSHA512 == sha && $0.marker.intendedPayloadPath != nil
+        }) else { throw SaveError.saveContextUnavailable }
+        guard current.cloudSyncMetadata?.localHeadOperationID == owner.id,
+              current.cloudSyncMetadata?.keyEpoch == owner.marker.keyEpoch,
+              owner.marker.localCommitBaseline?.hasCompatibleEpoch(current) == true,
+              FileDigest.sha512(try environment.readData(DatabaseListStore.cacheLocation(for: current))) == sha,
+              let path = owner.marker.intendedPayloadPath,
+              FileDigest.sha512(try environment.readData(resolveAppGroupURL(for: path, environment: environment))) == sha else {
+            throw SaveError.saveContextUnavailable
+        }
+        let journal = try readJournal(for: databaseID, environment: environment)
+        for source in sources where source.id != owner.id {
+            guard source.marker.confirmedAt == nil,
+                  source.marker.uploadAttemptID == nil || source.marker.attemptIsFenced == true,
+                  journal.contains(where: { $0.id == source.id && $0.marker == source.marker }),
+                  FileDigest.sha512(try readImmutablePayload(source, environment: environment)) == source.marker.intendedPayloadSHA512 else {
                 throw SaveError.saveContextUnavailable
             }
-            let journal = try readJournal(for: databaseID, environment: environment)
-            for source in sources where source.id != owner.id {
-                guard source.marker.confirmedAt == nil,
-                      source.marker.uploadAttemptID == nil || source.marker.attemptIsFenced == true,
-                      journal.contains(where: { $0.id == source.id && $0.marker == source.marker }),
-                      FileDigest.sha512(try readImmutablePayload(source, environment: environment)) == source.marker.intendedPayloadSHA512 else {
-                    throw SaveError.saveContextUnavailable
-                }
-            }
-            owner.marker.absorbedOperationIDs = Array(Set((owner.marker.absorbedOperationIDs ?? []) + sources.map(\.id)))
-            owner = try update(owner, environment: environment)
-            for source in sources where source.id != owner.id {
-                guard try dropIfUnchanged(source, environment: environment) else { throw SaveError.saveContextUnavailable }
-            }
+        }
+        owner.marker.absorbedOperationIDs = Array(Set((owner.marker.absorbedOperationIDs ?? []) + sources.map(\.id)))
+        owner = try update(owner, environment: environment)
+        for source in sources where source.id != owner.id {
+            guard try dropIfUnchanged(source, environment: environment) else { throw SaveError.saveContextUnavailable }
         }
     }
 
@@ -611,7 +611,7 @@ enum PendingUploadQueue {
     static func prepare(
         reference: DatabaseReference, currentData: Data, intendedData: Data,
         cacheURL: URL, keyChange: KeyChange? = nil,
-        remoteBaseSHA512: Data? = nil, environment: Environment = .live
+        remoteBaseSHA512: Data? = nil, operationID: UUID = UUID(), environment: Environment = .live
     ) throws -> StoredMarker {
         try assertCreationAllowsMutation(reference, environment: environment)
         guard let current = DatabaseListStore.databases.first(where: { $0.id == reference.id }),
@@ -636,7 +636,6 @@ enum PendingUploadQueue {
             }
         }
         let predecessor = markers.last { $0.marker.isPayloadFinalized == true && $0.marker.openTimeSHA512 == currentSHA }
-        let operationID = UUID()
         let directory = queueDirectoryURL(for: reference.id, environment: environment)
         try environment.createDirectory(directory)
         let payloadURL = directory.appendingPathComponent("\(operationID.uuidString).kdbx")

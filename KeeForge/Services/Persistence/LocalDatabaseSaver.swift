@@ -200,6 +200,9 @@ enum LocalDatabaseSaver {
         var association: PendingLocalSaveStore.KeyFileAssociation?
         var prepared: PendingLocalSaveStore.PreparedSource?
         var targetIsSharedCopy = false
+        var cacheLease: PendingLocalSaveStore.CacheReadLease?
+        var coordinatedFence: (@Sendable (URL, () throws -> ReplaceOutcome) throws -> ReplaceOutcome)?
+        var beforeReplacement: (@Sendable () throws -> Void)?
         var storageIO = PendingLocalSaveStore.StorageIO()
     }
 
@@ -1142,6 +1145,7 @@ enum LocalDatabaseSaver {
                     let staged = stagingDirectory.appendingPathComponent("keeforge-save-\(UUID().uuidString)")
                     try io.stage(data, staged)
                     let perform: (PendingLocalSaveStore.CommitReceipt?) throws -> ReplaceOutcome = { receipt in
+                        try authorization?.beforeReplacement?()
                         enteredReplacement = true
                         phase = "replacement"
                         var replacementThrew = false
@@ -1169,22 +1173,26 @@ enum LocalDatabaseSaver {
                     }
                     if let authorization {
                         phase = "owner"
-                        let authorized = try PendingLocalSaveStore.withWriteAuthorization(
-                            for: authorization.databaseID, token: authorization.token,
-                            expectedMasterKeyChangeAt: authorization.expectedMasterKeyChangeAt,
-                            enforcesEpoch: authorization.enforcesEpoch, isMasterKeyChange: authorization.isMasterKeyChange,
-                            association: authorization.association, prepared: authorization.prepared,
-                            intendedSHA512: intended, observeTarget: {
-                                let bytes = try Data(contentsOf: readingURL ?? writingURL)
-                                if let expectedSHA512, FileDigest.sha512(bytes) != expectedSHA512 {
-                                    throw CoordinatedConflict(currentData: bytes)
-                                }
-                                return (try PendingLocalSaveStore.targetIdentity(at: writingURL), FileDigest.sha512(bytes))
-                            }, targetIsSharedCopy: authorization.targetIsSharedCopy,
-                            io: authorization.storageIO, perform
-                        )
-                        targetWrite = authorized.targetWrite
-                        return authorized.value
+                        let replaceWithOwner = { () throws -> ReplaceOutcome in
+                            let authorized = try PendingLocalSaveStore.withWriteAuthorization(
+                                for: authorization.databaseID, token: authorization.token,
+                                expectedMasterKeyChangeAt: authorization.expectedMasterKeyChangeAt,
+                                enforcesEpoch: authorization.enforcesEpoch, isMasterKeyChange: authorization.isMasterKeyChange,
+                                association: authorization.association, prepared: authorization.prepared,
+                                intendedSHA512: intended, observeTarget: {
+                                    let bytes = try Data(contentsOf: readingURL ?? writingURL)
+                                    if let expectedSHA512, FileDigest.sha512(bytes) != expectedSHA512 {
+                                        throw CoordinatedConflict(currentData: bytes)
+                                    }
+                                    return (try PendingLocalSaveStore.targetIdentity(at: writingURL), FileDigest.sha512(bytes))
+                                }, targetIsSharedCopy: authorization.targetIsSharedCopy,
+                                cacheLease: authorization.cacheLease, io: authorization.storageIO, perform
+                            )
+                            targetWrite = authorized.targetWrite
+                            return authorized.value
+                        }
+                        if let fence = authorization.coordinatedFence { return try fence(writingURL, replaceWithOwner) }
+                        return try replaceWithOwner()
                     }
                     return try perform(nil)
                 } catch let conflict as CoordinatedConflict { return .changed(currentData: conflict.currentData) }

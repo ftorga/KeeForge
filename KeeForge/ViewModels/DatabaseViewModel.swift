@@ -670,6 +670,7 @@ final class DatabaseViewModel {
     private let keyCommitPublicationTimeout: Duration
     private var keyCommitPublicationActionID: UUID?
     private var keyCommitPublicationPermit: DatabaseListStore.KeyCommitPublicationPermit?
+    @ObservationIgnored private var activeCloudMergeContext: CloudDatabaseSaver.MergeContext?
     private let cloudSaveOperation: CloudSaveOperation
     private let conflictCopyEncryptionOperation: ConflictCopyEncryptionOperation
     private let localConflictCopyOperation: LocalConflictCopyOperation
@@ -2369,6 +2370,7 @@ final class DatabaseViewModel {
     }
 
     func lock(manuallyTriggered: Bool = false, preservingClipboard: Bool = false) {
+        activeCloudMergeContext?.revoke()
         secretAccess.invalidate()
         cancelInactivityTimer()
         hardwareKeyTask?.cancel()
@@ -3444,34 +3446,37 @@ final class DatabaseViewModel {
         } else { mergedCloudSources = [] }
 
         let merged: KDBXMerger.Merged
+        var mergeContext: CloudDatabaseSaver.MergeContext?
         do {
-            var root = localDraft.rootGroup
-            var meta = localDraft.meta
-            for source in mergedCloudSources {
-                let sourceBytes = try await Task.detached { try PendingUploadQueue.readImmutablePayload(source) }.value
-                let included = try await Self.mergeRemoteOffMain(remoteData: sourceBytes, compositeKey: compositeKey,
-                    sessionKey: sessionKey, localRootGroup: root, localMeta: meta,
+            if !mergedCloudSources.isEmpty {
+                let reference = databaseReference
+                let remote = try await cloudRefreshOperation(reference) { _ in }
+                let authenticated = try await CloudMergeAuthentication.merging(reference: reference, sources: mergedCloudSources,
+                    remote: remote, draft: localDraft, compositeKey: compositeKey, sessionKey: sessionKey)
+                merged = authenticated.0
+                mergeContext = try await Task.detached { try CloudDatabaseSaver.MergeContext.capture(authenticated.1) }.value
+            } else {
+                merged = try await Self.mergeRemoteOffMain(remoteData: conflict.remoteData, compositeKey: compositeKey,
+                    sessionKey: sessionKey, localRootGroup: localDraft.rootGroup, localMeta: localDraft.meta,
                     localBinaryPoolFields: localBinaryPoolFields ?? [])
-                root = included.rootGroup
-                meta = included.meta
             }
-            merged = try await Self.mergeRemoteOffMain(
-                remoteData: conflict.remoteData,
-                compositeKey: compositeKey,
-                sessionKey: sessionKey,
-                localRootGroup: root,
-                localMeta: meta,
-                localBinaryPoolFields: localBinaryPoolFields ?? []
-            )
+        } catch let source as CloudMergeAuthentication.SourceFailure {
+            mergeFailure = source.failure
+            return
         } catch let failure as DatabaseMergeFailure {
             mergeFailure = failure
             return
         }
+        if let mergeContext {
+            activeCloudMergeContext?.revoke()
+            activeCloudMergeContext = mergeContext
+        }
+        defer { mergeContext?.finish(); if activeCloudMergeContext === mergeContext { activeCloudMergeContext = nil } }
 
         // Locked while the merge ran: the merged tree holds session secrets and
         // must not resurrect behind the lock screen.
         guard expectedLockCycleID == lockCycleID,
-                  cloudKeyAction == nil || keyCommitPublicationActionID == cloudKeyAction else { return }
+                  cloudKeyAction == nil || keyCommitPublicationActionID == cloudKeyAction else { mergeContext?.revoke(); return }
 
         let mergedDraft = DatabaseDraft(
             rootGroup: merged.rootGroup,
@@ -3497,16 +3502,19 @@ final class DatabaseViewModel {
                 nil
             )
         case .cloud:
-            saveResult = try await cloudSaveOperation(
+            let context = mergeContext
+            saveResult = try await withTaskCancellationHandler {
+                try await CloudDatabaseSaver.$mergeContext.withValue(context) { try await cloudSaveOperation(
                 mergedDraft,
                 databaseReference,
                 compositeKey,
                 openTimeSHA512,
-                conflict.remoteSHA512,
+                context?.remoteSHA512 ?? conflict.remoteSHA512,
                 databaseReference.expectedCloudRevision,
                 nil,
                 nil
-            )
+            ) }
+            } onCancel: { context?.revoke() }
         }
 
         guard expectedLockCycleID == lockCycleID,
@@ -3529,11 +3537,8 @@ final class DatabaseViewModel {
                 guard expectedLockCycleID == lockCycleID,
                   cloudKeyAction == nil || keyCommitPublicationActionID == cloudKeyAction else { return }
             }
-            if !mergedCloudSources.isEmpty, !saveResult.hasUnconfirmedDurability {
-                let id = databaseReference.id
-                try await Task.detached {
-                    try PendingUploadQueue.transferMergedSources(mergedCloudSources, toPayloadSHA512: newSHA512, for: id)
-                }.value
+            if let mergeContext, !saveResult.hasUnconfirmedDurability {
+                try await Task.detached { try mergeContext.consume(sha512: newSHA512) }.value
             }
             refreshDatabaseReference()
             populateCredentialStoreIfNeeded(root: mergedDraft.rootGroup)
@@ -3559,10 +3564,8 @@ final class DatabaseViewModel {
         mergeFailure = nil
     }
 
-    /// Merges every conflicted AutoFill save for this database into the
-    /// session's tree and uploads the result. The pending uploads are dropped
-    /// only once that upload has succeeded; any other outcome leaves them, and
-    /// their bytes, exactly where they were.
+    /// Transfers authenticated pending snapshots into one durable queued output;
+    /// provider delivery remains a separate journal operation.
     func mergePendingUploads() async throws {
         guard case .unlocked = state,
               databaseReference.isCloudBacked,
@@ -3622,77 +3625,51 @@ final class DatabaseViewModel {
         // writes the whole tree, so leaving them out would drop them.
         let localDraft = try makeWorkingDraft()
         let localBinaryPoolFields = localDraft.binaryPoolFields
-        var mergedRootGroup = localDraft.rootGroup
-        var mergedMeta = localDraft.meta
-        var failedLocation = PendingUploadRecovery.Location.cache
+        let sources = try await Task.detached { try PendingUploadQueue.readJournal(for: reference.id) }.value
+        let remoteResolution = try await cloudRefreshOperation(reference) { _ in }
+        guard expectedLockCycleID == lockCycleID, keyCommitPublicationActionID == cloudKeyAction else { return }
+        let merged: KDBXMerger.Merged
+        let authentication: CloudMergeAuthentication
         do {
-            for payload in payloads {
-                failedLocation = payload.location
-                let merged = try await Self.mergeRemoteOffMain(
-                    remoteData: payload.data,
-                    compositeKey: compositeKey,
-                    sessionKey: sessionKey,
-                    localRootGroup: mergedRootGroup,
-                    localMeta: mergedMeta,
-                    localBinaryPoolFields: localBinaryPoolFields ?? []
-                )
-                mergedRootGroup = merged.rootGroup
-                mergedMeta = merged.meta
-            }
-        } catch let failure as DatabaseMergeFailure {
-            switch failure {
-            case .remoteUnreadable:
-                pendingUploadMergeFailure = .changeUnreadable(failedLocation)
-            case .attachmentsDiverged:
-                pendingUploadMergeFailure = .attachmentsDiverged(failedLocation)
-            case .sessionUnavailable:
-                pendingUploadMergeFailure = .sessionUnavailable
+            (merged, authentication) = try await CloudMergeAuthentication.merging(reference: reference, sources: sources,
+                remote: remoteResolution, draft: localDraft, compositeKey: compositeKey, sessionKey: sessionKey,
+                locations: Dictionary(uniqueKeysWithValues: payloads.map { ($0.storedMarker.id, $0.location) }))
+        } catch let source as CloudMergeAuthentication.SourceFailure {
+            switch source.failure {
+            case .remoteUnreadable: pendingUploadMergeFailure = .changeUnreadable(source.location)
+            case .attachmentsDiverged: pendingUploadMergeFailure = .attachmentsDiverged(source.location)
+            case .sessionUnavailable: pendingUploadMergeFailure = .sessionUnavailable
             }
             return
         }
-
-        guard expectedLockCycleID == lockCycleID,
-                  cloudKeyAction == nil || keyCommitPublicationActionID == cloudKeyAction else { return }
-
-        let remoteResolution = try await cloudRefreshOperation(reference) { _ in }
-        guard Self.reachedCloud(remoteResolution.status) else { throw CloudProviderError.networkUnavailable }
-        guard expectedLockCycleID == lockCycleID, keyCommitPublicationActionID == cloudKeyAction else { return }
-        let remote = try await Self.mergeRemoteOffMain(remoteData: remoteResolution.data,
-            compositeKey: compositeKey, sessionKey: sessionKey, localRootGroup: mergedRootGroup,
-            localMeta: mergedMeta, localBinaryPoolFields: localBinaryPoolFields ?? [])
-        mergedRootGroup = remote.rootGroup
-        mergedMeta = remote.meta
-        let remoteSHA512 = FileDigest.sha512(remoteResolution.data)
-
-        let mergedDraft = DatabaseDraft(
-            rootGroup: mergedRootGroup,
-            meta: mergedMeta,
-            sessionKey: sessionKey,
-            binaryPoolFields: localBinaryPoolFields
-        )
-        // Written even when the merge added nothing: only a completed upload
-        // proves the cloud copy holds the change, and that proof is what
-        // allows dropping the pending uploads.
-        let saveResult = try await cloudSaveOperation(
+        let context = try await Task.detached { try CloudDatabaseSaver.MergeContext.capture(authentication) }.value
+        guard expectedLockCycleID == lockCycleID, keyCommitPublicationActionID == cloudKeyAction else { context.revoke(); return }
+        activeCloudMergeContext?.revoke()
+        activeCloudMergeContext = context
+        defer { context.finish(); if activeCloudMergeContext === context { activeCloudMergeContext = nil } }
+        let mergedDraft = DatabaseDraft(rootGroup: merged.rootGroup, meta: merged.meta, sessionKey: sessionKey,
+            binaryPoolFields: localBinaryPoolFields)
+        // Even an unchanged tree needs an installed durable output before source ownership transfers.
+        let saveResult = try await withTaskCancellationHandler {
+            try await CloudDatabaseSaver.$mergeContext.withValue(context) { try await cloudSaveOperation(
             mergedDraft,
             reference,
             compositeKey,
             openTimeSHA512,
-            remoteSHA512,
+            authentication.remoteSHA512,
             reference.expectedCloudRevision,
             nil,
             nil
-        )
+        ) }
+        } onCancel: { context.revoke() }
 
         switch saveResult {
         case .saved(let newSHA512, let expressKey, _),
              .committedWithoutConfirmedDurability(let newSHA512, let expressKey, _, _):
-            let resolvedMarkers = payloads.map(\.storedMarker)
-            let mergedReferenceID = databaseReference.id
             let transferred = await Task.detached(priority: .userInitiated) {
                 do {
                     guard !saveResult.hasUnconfirmedDurability else { return false }
-                    try PendingUploadQueue.transferMergedSources(resolvedMarkers, toPayloadSHA512: newSHA512, for: mergedReferenceID)
+                    try context.consume(sha512: newSHA512)
                     return true
                 } catch { return false }
             }.value
@@ -3930,6 +3907,54 @@ final class DatabaseViewModel {
 
     func acknowledgeMergeSummary() {
         mergeSummaryMessage = nil
+    }
+
+    struct CloudMergeAuthentication: Sendable {
+        let operationID: UUID
+        let reference: DatabaseReference
+        let sources: [PendingUploadQueue.StoredMarker]
+        let remoteSHA512: Data
+        private init(reference: DatabaseReference, sources: [PendingUploadQueue.StoredMarker], remoteSHA512: Data) {
+            operationID = UUID()
+            self.reference = reference
+            self.sources = sources
+            self.remoteSHA512 = remoteSHA512
+        }
+        struct SourceFailure: Error {
+            let failure: DatabaseMergeFailure
+            let location: PendingUploadRecovery.Location
+        }
+        nonisolated static func merging(reference: DatabaseReference, sources: [PendingUploadQueue.StoredMarker],
+            remote: CloudSyncResolution, draft: DatabaseDraft, compositeKey: SymmetricKey, sessionKey: SymmetricKey,
+            locations: [UUID: PendingUploadRecovery.Location] = [:]) async throws -> (KDBXMerger.Merged, Self) {
+            guard !sources.isEmpty, remote.status == .current || remote.status == .downloaded,
+                  reference.id == remote.reference.id,
+                  reference.cloudSyncMetadata?.provider == remote.reference.cloudSyncMetadata?.provider,
+                  reference.cloudSyncMetadata?.accountId == remote.reference.cloudSyncMetadata?.accountId,
+                  reference.cloudSyncMetadata?.fileId == remote.reference.cloudSyncMetadata?.fileId,
+                  sources.allSatisfy({ $0.marker.databaseId == reference.id && CloudJournalDecision.state(of: $0.marker) == .ready
+                    && $0.marker.keyEpoch == reference.cloudSyncMetadata?.keyEpoch
+                    && $0.marker.localCommitBaseline?.hasCompatibleEpoch(reference) == true }) else { throw CloudSaveRecoveryWarning() }
+            var root = draft.rootGroup
+            var meta = draft.meta
+            for source in sources {
+                let data = try await Task.detached { try PendingUploadQueue.readImmutablePayload(source) }.value
+                do {
+                    let included = try await DatabaseViewModel.mergeRemoteOffMain(remoteData: data, compositeKey: compositeKey,
+                        sessionKey: sessionKey, localRootGroup: root, localMeta: meta,
+                        localBinaryPoolFields: draft.binaryPoolFields ?? [])
+                    root = included.rootGroup
+                    meta = included.meta
+                } catch let failure as DatabaseMergeFailure {
+                    throw SourceFailure(failure: failure, location: locations[source.id] ?? .cache)
+                }
+            }
+            let merged = try await DatabaseViewModel.mergeRemoteOffMain(remoteData: remote.data,
+                compositeKey: compositeKey, sessionKey: sessionKey, localRootGroup: root, localMeta: meta,
+                localBinaryPoolFields: draft.binaryPoolFields ?? [])
+            let digest = await Task.detached { FileDigest.sha512(remote.data) }.value
+            return (merged, Self(reference: reference, sources: sources, remoteSHA512: digest))
+        }
     }
 
     /// Parses the conflicting file and merges it into the local side, all off
@@ -4922,6 +4947,7 @@ final class DatabaseViewModel {
 
     /// Starts an unlock attempt and returns its token for `finishUnlockAttempt`.
     private func prepareForUnlock() -> UUID {
+        activeCloudMergeContext?.revoke()
         keyCommitPublicationPermit?.close()
         keyCommitPublicationActionID = nil
         authenticatedLocalCiphertext = nil

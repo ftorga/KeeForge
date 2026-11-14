@@ -13,6 +13,199 @@ enum CloudDatabaseSaver {
     typealias ProgressHandler = @Sendable (Double) -> Void
     @TaskLocal static var keyChange: PendingUploadQueue.KeyChange?
 
+    /// One authenticated merge invocation; never serialized and never a Keychain grant.
+    final class MergeContext: @unchecked Sendable {
+        private enum Phase { case authenticated, saving, replacing, durable, consuming, revoked, finished }
+        let operationID: UUID
+        let beforeReference: DatabaseReference
+        let sources: [PendingUploadQueue.StoredMarker]
+        let remoteSHA512: Data
+        private let reference: DatabaseReference
+        private let cacheSHA512: Data
+        var localBaseline: SaveBaseline { .init(openTimeSHA512: cacheSHA512, reconciledRemoteSHA512: nil) }
+        private let target: PendingLocalSaveStore.TargetIdentity
+        let lease: PendingLocalSaveStore.CacheReadLease
+        private let lock = NSLock()
+        private var phase: Phase = .authenticated
+        private var output: PendingLocalSaveStore.InstalledTarget?
+
+        private init(_ authentication: DatabaseViewModel.CloudMergeAuthentication, reference: DatabaseReference,
+                     sha512: Data, target: PendingLocalSaveStore.TargetIdentity, lease: PendingLocalSaveStore.CacheReadLease) {
+            operationID = authentication.operationID
+            beforeReference = authentication.reference
+            sources = authentication.sources
+            remoteSHA512 = authentication.remoteSHA512
+            self.reference = reference
+            cacheSHA512 = sha512
+            self.target = target
+            self.lease = lease
+        }
+
+        static func capture(_ authentication: DatabaseViewModel.CloudMergeAuthentication) throws -> MergeContext {
+            let before = authentication.reference
+            guard let current = DatabaseListStore.databases.first(where: { $0.id == before.id }), sameEpoch(before, current) else {
+                throw SaveError.saveContextUnavailable
+            }
+            let cache = DatabaseListStore.cacheLocation(for: current)
+            var result: Result<MergeContext, Error>?
+            var error: NSError?
+            NSFileCoordinator().coordinate(readingItemAt: cache, error: &error) { protected in
+                result = Result {
+                    try DatabaseListStore.withCloudMergeReference(current) { current in
+                        try PendingUploadQueue.withCommitLock(for: current.id, nonBlocking: true) {
+                            let bytes = try Data(contentsOf: protected)
+                            let sha = FileDigest.sha512(bytes)
+                            guard authentication.sources.contains(where: {
+                                $0.id == current.cloudSyncMetadata?.localHeadOperationID && $0.marker.intendedPayloadSHA512 == sha
+                            }) else { throw SaveError.saveContextUnavailable }
+                            let context = MergeContext(authentication, reference: current, sha512: sha,
+                                target: try PendingLocalSaveStore.targetIdentity(at: protected),
+                                lease: try PendingLocalSaveStore.captureCacheReadLease(for: current))
+                            try PendingLocalSaveStore.withReferenceEpochAuthorization(context.lease) {}
+                            try context.validateSources(allowingOutput: false)
+                            return context
+                        }
+                    }
+                }
+            }
+            if let result { return try result.get() }
+            throw error ?? CocoaError(.fileReadUnknown)
+        }
+
+        private static func sameEpoch(_ before: DatabaseReference, _ current: DatabaseReference) -> Bool {
+            before.id == current.id && before.cloudSyncMetadata?.provider == current.cloudSyncMetadata?.provider
+                && before.cloudSyncMetadata?.accountId == current.cloudSyncMetadata?.accountId
+                && before.cloudSyncMetadata?.fileId == current.cloudSyncMetadata?.fileId
+                && before.cloudSyncMetadata?.keyEpoch == current.cloudSyncMetadata?.keyEpoch
+                && before.lastMasterKeyChangeAt == current.lastMasterKeyChangeAt
+                && before.keyFileBookmarkData == current.keyFileBookmarkData && before.keyFileFilename == current.keyFileFilename
+                && before.bookmarkData == current.bookmarkData && before.hardwareKey == current.hardwareKey
+                && before.legacyKeychainFilename == current.legacyKeychainFilename && before.isReadOnly == current.isReadOnly
+        }
+
+        func revoke() { lock.withLock { if phase != .replacing && phase != .consuming { phase = .revoked } } }
+        func finish() { lock.withLock { phase = .finished } }
+        func begin(reference: DatabaseReference, remoteSHA512: Data?) throws {
+            try lock.withLock {
+                guard phase == .authenticated, reference == beforeReference, remoteSHA512 == self.remoteSHA512 else {
+                    throw SaveError.saveContextUnavailable
+                }
+                phase = .saving
+            }
+        }
+        private func requireSaving() throws {
+            guard lock.withLock({ phase == .saving }) else { throw CancellationError() }
+        }
+        func claimReplacement() throws {
+            try lock.withLock {
+                guard phase == .saving else { throw CancellationError() }
+                phase = .replacing
+            }
+        }
+        private func validateSources(allowingOutput: Bool) throws {
+            let journal = try PendingUploadQueue.readJournal(for: reference.id)
+            let originals = journal.filter { !allowingOutput || $0.id != operationID }
+            guard originals.count == sources.count else { throw SaveError.saveContextUnavailable }
+            for source in sources {
+                guard source.marker.databaseId == reference.id, CloudJournalDecision.state(of: source.marker) == .ready,
+                      source.marker.keyEpoch == reference.cloudSyncMetadata?.keyEpoch,
+                      source.marker.localCommitBaseline?.hasCompatibleEpoch(reference) == true,
+                      originals.contains(where: { $0.id == source.id && $0.marker == source.marker }),
+                      FileDigest.sha512(try PendingUploadQueue.readImmutablePayload(source)) == source.marker.intendedPayloadSHA512 else {
+                    throw SaveError.saveContextUnavailable
+                }
+            }
+            if allowingOutput {
+                guard let own = journal.first(where: { $0.id == operationID }), own.marker.keyEpoch == reference.cloudSyncMetadata?.keyEpoch,
+                      own.marker.confirmedAt == nil, own.marker.uploadAttemptID == nil else { throw SaveError.saveContextUnavailable }
+            }
+        }
+        func readBeforeEncryption() throws -> Data {
+            try requireSaving()
+            let cache = DatabaseListStore.cacheLocation(for: reference)
+            var result: Result<Data, Error>?
+            var error: NSError?
+            NSFileCoordinator().coordinate(readingItemAt: cache, error: &error) { protected in
+                result = Result {
+                    try DatabaseListStore.withCloudMergeReference(reference) { _ in
+                        try PendingUploadQueue.withCommitLock(for: reference.id, nonBlocking: true) {
+                            try requireSaving()
+                            try validateSources(allowingOutput: false)
+                            let bytes = try Data(contentsOf: protected)
+                            guard FileDigest.sha512(bytes) == cacheSHA512,
+                                  try PendingLocalSaveStore.targetIdentity(at: protected) == target else { throw SaveError.saveContextUnavailable }
+                            try PendingLocalSaveStore.withReferenceEpochAuthorization(lease) {}
+                            return try PendingLocalSaveStore.withCachePublicationAuthorization(for: reference.id, sha512: cacheSHA512, lease: lease) { bytes }
+                        }
+                    }
+                }
+            }
+            if let result { return try result.get() }
+            throw error ?? CocoaError(.fileReadUnknown)
+        }
+        /// Caller already holds the commit lease; no coordination or waiting for list lock here.
+        func validateBeforePreparation() throws {
+            try DatabaseListStore.withCloudMergeReference(reference) { _ in
+                try requireSaving()
+                try validateSources(allowingOutput: false)
+                let cache = DatabaseListStore.cacheLocation(for: reference)
+                guard try PendingLocalSaveStore.targetIdentity(at: cache) == target,
+                      FileDigest.sha512(try Data(contentsOf: cache)) == cacheSHA512 else { throw SaveError.saveContextUnavailable }
+            }
+        }
+        func withReplacementFence(at cache: URL, _ replace: () throws -> LocalDatabaseSaver.ReplaceOutcome) throws -> LocalDatabaseSaver.ReplaceOutcome {
+            try DatabaseListStore.withCloudMergeReference(reference) { _ in
+                try requireSaving()
+                try validateSources(allowingOutput: true)
+                guard try PendingLocalSaveStore.targetIdentity(at: cache) == target,
+                      FileDigest.sha512(try Data(contentsOf: cache)) == cacheSHA512 else { throw SaveError.saveContextUnavailable }
+                return try replace()
+            }
+        }
+        func recordDurableOutput(_ outcome: LocalDatabaseSaver.ReplaceOutcome, sha512: Data) throws {
+            guard case .replaced(let receipt) = outcome, let receipt, let commit = receipt.targetCommit,
+                  commit.isConfirmed, commit.snapshot.sha512 == sha512 else { throw CloudSaveRecoveryWarning() }
+            try lock.withLock {
+                guard phase == .replacing else { throw CloudSaveRecoveryWarning() }
+                output = commit.snapshot
+                phase = .durable
+            }
+        }
+        func consume(sha512: Data) throws {
+            guard let installed = lock.withLock({ phase == .durable ? output : nil }), installed.sha512 == sha512 else {
+                throw CloudSaveRecoveryWarning()
+            }
+            var expected = reference
+            expected.updateCloudSyncMetadata { $0.localHeadOperationID = operationID }
+            let cache = DatabaseListStore.cacheLocation(for: reference)
+            var result: Result<Void, Error>?
+            var error: NSError?
+            NSFileCoordinator().coordinate(readingItemAt: cache, error: &error) { protected in
+                result = Result {
+                    try DatabaseListStore.withCloudMergeReference(expected) { current in
+                        try PendingUploadQueue.withCommitLock(for: current.id, nonBlocking: true) {
+                            try validateSources(allowingOutput: true)
+                            guard try PendingLocalSaveStore.targetIdentity(at: protected) == installed.target,
+                                  FileDigest.sha512(try Data(contentsOf: protected)) == sha512 else { throw SaveError.saveContextUnavailable }
+                            try PendingLocalSaveStore.withReferenceEpochAuthorization(lease) {}
+                            try PendingLocalSaveStore.withCachePublicationAuthorization(for: current.id, sha512: sha512, lease: lease) {
+                                try lock.withLock {
+                                    guard phase == .durable else { throw CancellationError() }
+                                    phase = .consuming
+                                }
+                                try PendingUploadQueue.transferMergedSourcesLocked(sources, toPayloadSHA512: sha512, reference: current)
+                            }
+                        }
+                    }
+                }
+            }
+            if let result { try result.get(); return }
+            throw error ?? CocoaError(.fileReadUnknown)
+        }
+    }
+
+    @TaskLocal static var mergeContext: MergeContext?
+
     enum PendingUploadPushResult: Sendable, Equatable {
         case saved(updatedReference: DatabaseReference)
         /// Remote confirmation is durable, but the journal still owns the ciphertext.
@@ -47,8 +240,14 @@ enum CloudDatabaseSaver {
             return provider.writeGuarantee(expectedRev: rev, byteCount: count)
         }
         var replaceFile: @Sendable (Data, URL, Data?, DatabaseReference) throws -> LocalDatabaseSaver.ReplaceOutcome = { data, url, sha, reference in
-            try LocalDatabaseSaver.replaceFileAtomically(data, at: url, expectedSHA512: sha,
-                authorization: .init(databaseID: reference.id, enforcesEpoch: false, targetIsSharedCopy: true))
+            var authorization = LocalDatabaseSaver.ReplacementAuthorization(databaseID: reference.id,
+                enforcesEpoch: false, targetIsSharedCopy: true)
+            if let context = mergeContext {
+                authorization.cacheLease = context.lease
+                authorization.coordinatedFence = { target, replace in try context.withReplacementFence(at: target, replace) }
+                authorization.beforeReplacement = { try context.claimReplacement() }
+            }
+            return try LocalDatabaseSaver.replaceFileAtomically(data, at: url, expectedSHA512: sha, authorization: authorization)
         }
         var synchronizeCacheFile: @Sendable (URL) throws -> Void = CloudDatabaseSaver.synchronizeCacheFile
         var synchronizeCacheDirectory: @Sendable (URL) throws -> Void = synchronizeDirectory
@@ -161,8 +360,13 @@ enum CloudDatabaseSaver {
             }
         }
 
+        let mergeContext = Self.mergeContext
+        if let mergeContext {
+            guard newCompositeKey == nil, encryptionSettings == nil else { throw SaveError.saveContextUnavailable }
+            try mergeContext.begin(reference: reference, remoteSHA512: reconciledRemoteSHA512)
+        }
         do { return try await Task.detached(priority: .utility) {
-            try await saveOffMain(
+            try await Self.$mergeContext.withValue(mergeContext) { try await saveOffMain(
                 draft: draft,
                 reference: reference,
                 compositeKey: compositeKey,
@@ -176,7 +380,7 @@ enum CloudDatabaseSaver {
                 encryptionSettings: encryptionSettings,
                 keyChange: keyChange,
                 environment: environment
-            )
+            ) }
         }.value } catch {
             let requiresRecovery: Bool
             do {
@@ -214,9 +418,10 @@ enum CloudDatabaseSaver {
             throw SaveError.saveContextUnavailable
         }
         let cacheURL = environment.cacheURL(reference)
-        let currentData = try environment.readData(cacheURL)
+        let currentData = try mergeContext?.readBeforeEncryption() ?? environment.readData(cacheURL)
         let currentSHA512 = FileDigest.sha512(currentData)
-        guard baseline.covers(currentSHA512) else {
+        let localBaseline = mergeContext?.localBaseline ?? baseline
+        guard localBaseline.covers(currentSHA512) else {
             return .conflict(remoteSHA512: currentSHA512, remoteData: currentData)
         }
 
@@ -267,6 +472,7 @@ enum CloudDatabaseSaver {
 
         var intent: PendingUploadQueue.StoredMarker?
         let replacement = try PendingUploadQueue.withCommitLock(for: reference.id, environment: environment.queue) {
+            try mergeContext?.validateBeforePreparation()
             let latest = try environment.readData(cacheURL)
             guard FileDigest.sha512(latest) == currentSHA512 else { return LocalDatabaseSaver.ReplaceOutcome.changed(currentData: latest) }
             guard let latestReference = DatabaseListStore.databases.first(where: { $0.id == reference.id }) else {
@@ -277,7 +483,7 @@ enum CloudDatabaseSaver {
             var prepared = try PendingUploadQueue.prepare(
                 reference: latestReference, currentData: currentData, intendedData: newData,
                 cacheURL: cacheURL, keyChange: keyChange,
-                remoteBaseSHA512: baseline.reconciledRemoteSHA512, environment: environment.queue
+                remoteBaseSHA512: baseline.reconciledRemoteSHA512, operationID: mergeContext?.operationID ?? UUID(), environment: environment.queue
             )
             intent = prepared
             if keyChange != nil { return .replaced() }
@@ -331,6 +537,7 @@ enum CloudDatabaseSaver {
             case .conflict: throw CloudProviderError.conflict(remoteRev: nil)
             }
         } else {
+            if let mergeContext, case .replaced = replacement { try mergeContext.recordDurableOutput(replacement, sha512: FileDigest.sha512(newData)) }
             PendingUploadQueue.postEnqueuedNotification(environment: environment.queue)
         }
         try? environment.pruneBackups(reference, 5)

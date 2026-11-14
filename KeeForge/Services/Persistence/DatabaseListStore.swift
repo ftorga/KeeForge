@@ -1109,6 +1109,26 @@ enum DatabaseListStore {
         throw coordinatorError ?? CocoaError(.fileReadUnknown)
     }
 
+    /// Called only inside target coordination; never waits for the registry lock.
+    static func withCloudMergeReference<T>(_ expected: DatabaseReference, _ body: (DatabaseReference) throws -> T) throws -> T {
+        guard stateLock.try() else { throw SaveError.saveContextUnavailable }
+        defer { stateLock.unlock() }
+        let references = try JSONDecoder().decode([DatabaseReference].self, from: Data(contentsOf: databaseListURL))
+        guard let current = references.first(where: { $0.id == expected.id }),
+              current.cloudSyncMetadata?.provider == expected.cloudSyncMetadata?.provider,
+              current.cloudSyncMetadata?.accountId == expected.cloudSyncMetadata?.accountId,
+              current.cloudSyncMetadata?.fileId == expected.cloudSyncMetadata?.fileId,
+              current.cloudSyncMetadata?.keyEpoch == expected.cloudSyncMetadata?.keyEpoch,
+              current.cloudSyncMetadata?.localHeadOperationID == expected.cloudSyncMetadata?.localHeadOperationID,
+              current.lastMasterKeyChangeAt == expected.lastMasterKeyChangeAt,
+              current.bookmarkData == expected.bookmarkData, current.hardwareKey == expected.hardwareKey,
+              current.keyFileBookmarkData == expected.keyFileBookmarkData,
+              current.keyFileFilename == expected.keyFileFilename,
+              current.legacyKeychainFilename == expected.legacyKeychainFilename,
+              current.isReadOnly == expected.isReadOnly else { throw SaveError.saveContextUnavailable }
+        return try body(current)
+    }
+
     /// Cache coordination precedes an immediate list/commit-lock attempt; contention rejects publication.
     static func withCloudKeyPublication<T>(
         for expected: DatabaseReference, sha512: Data, permit: KeyCommitPublicationPermit,
