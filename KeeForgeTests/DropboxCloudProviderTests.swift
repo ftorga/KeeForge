@@ -114,7 +114,8 @@ final class DropboxCloudProviderTests: XCTestCase {
                 catch { XCTAssertTrue(error is CloudFileCreationCoordinator.RecoveryRequired) }
             }
             XCTAssertGreaterThan(transport.canInitCount, 0)
-            XCTAssertEqual(transport.startLoadingCount, 1)
+            XCTAssertEqual(transport.startLoadingCount, transport.requests.count + transport.otherPaths.count)
+            XCTAssertEqual(transport.otherPaths, status == 409 ? ["/2/files/get_metadata"] : [])
             XCTAssertEqual(transport.requests.count, 1)
             XCTAssertEqual(transport.requests.first?.bytes, bytes)
             XCTAssertEqual(transport.requests.first?.path, "/probe-\(status).kdbx")
