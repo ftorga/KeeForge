@@ -1,4 +1,4 @@
-@preconcurrency import SwiftyDropbox
+@preconcurrency @testable import SwiftyDropbox
 import XCTest
 @testable import KeeForge
 
@@ -32,6 +32,17 @@ final class DropboxCloudProviderTests: XCTestCase {
         XCTAssertEqual(fields["path"], .str("/Vaults%20 100%/new%20db 100%.kdbx"))
     }
 
+    func testSDKProbeInterceptionIsRestrictedToItsRegisteredHost() throws {
+        let probe = DropboxHTTPProbe(status: 503)
+        defer { probe.close() }
+        let own = URLRequest(url: try XCTUnwrap(URL(string: "https://\(probe.host)/2/files/upload")))
+        let foreign = URLRequest(url: try XCTUnwrap(URL(string: "https://unregistered-dropbox-probe.invalid/2/files/upload")))
+        XCTAssertTrue(DropboxProbeURLProtocol.canInit(with: own))
+        XCTAssertFalse(DropboxProbeURLProtocol.canInit(with: foreign))
+        XCTAssertEqual(probe.startLoadingCount, 0)
+        XCTAssertTrue(probe.requests.isEmpty)
+    }
+
     @MainActor
     func testSDKAcceptedUploadWithLost503RetainsAttemptWithoutSecondRequest() async throws {
         DatabaseListStore.clearAll()
@@ -63,6 +74,8 @@ final class DropboxCloudProviderTests: XCTestCase {
                 return XCTFail("Unknown SDK request must never be sent again")
             }
         }
+        XCTAssertGreaterThan(transport.canInitCount, 0)
+        XCTAssertEqual(transport.startLoadingCount, 1)
         XCTAssertEqual(transport.requests.count, 1)
         XCTAssertEqual(transport.requests.first?.bytes, context.payload)
         XCTAssertEqual(transport.requests.first?.path, "/probe.kdbx")
@@ -100,6 +113,8 @@ final class DropboxCloudProviderTests: XCTestCase {
                 do { _ = try await CloudFileCreationCoordinator.resume(operationID: operationID, environment: environment); XCTFail("No blind resend") }
                 catch { XCTAssertTrue(error is CloudFileCreationCoordinator.RecoveryRequired) }
             }
+            XCTAssertGreaterThan(transport.canInitCount, 0)
+            XCTAssertEqual(transport.startLoadingCount, 1)
             XCTAssertEqual(transport.requests.count, 1)
             XCTAssertEqual(transport.requests.first?.bytes, bytes)
             XCTAssertEqual(transport.requests.first?.path, "/probe-\(status).kdbx")
@@ -340,6 +355,12 @@ private final class DropboxHTTPProbe: @unchecked Sendable {
     let status: Int
     private var uploads: [Upload] = []
     private var paths: [String] = []
+    private var canInitCalls = 0
+    private var starts = 0
+    var canInitCount: Int { lock.withLock { canInitCalls } }
+    var startLoadingCount: Int { lock.withLock { starts } }
+    func observedCanInit() { lock.withLock { canInitCalls += 1 } }
+    func observedStartLoading() { lock.withLock { starts += 1 } }
     var requests: [Upload] { lock.withLock { uploads } }
     var otherPaths: [String] { lock.withLock { paths } }
 
@@ -350,6 +371,7 @@ private final class DropboxHTTPProbe: @unchecked Sendable {
 
     func client() -> DropboxClient {
         var configuration = NetworkSessionConfiguration(kind: .default)
+        configuration.urlSessionConfiguration.protocolClasses = [DropboxProbeURLProtocol.self]
         configuration.timeoutIntervalForRequest = 5
         configuration.timeoutIntervalForResource = 5
         return DropboxClient(transportClient: DropboxTransportClientImpl(accessToken: "unit-transport-only",
@@ -394,13 +416,14 @@ private final class DropboxProbeURLProtocol: URLProtocol, @unchecked Sendable {
     private static let registry = Registry()
     static func install(_ probe: DropboxHTTPProbe) {
         registry.lock.withLock { registry.probes[probe.host] = probe }
-        URLProtocol.registerClass(Self.self)
     }
     static func remove(host: String) {
         registry.lock.withLock { _ = registry.probes.removeValue(forKey: host) }
     }
     override class func canInit(with request: URLRequest) -> Bool {
-        registry.lock.withLock { registry.probes[request.url?.host ?? ""] != nil }
+        guard let probe = registry.lock.withLock({ registry.probes[request.url?.host ?? ""] }) else { return false }
+        probe.observedCanInit()
+        return true
     }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() {
@@ -410,6 +433,7 @@ private final class DropboxProbeURLProtocol: URLProtocol, @unchecked Sendable {
             client?.urlProtocol(self, didFailWithError: URLError(.unsupportedURL))
             return
         }
+        probe.observedStartLoading()
         let result = probe.response(for: request)
         let actual = HTTPURLResponse(url: url, statusCode: result.0, httpVersion: "HTTP/1.1", headerFields: response.allHeaderFields as? [String: String])!
         client?.urlProtocol(self, didReceive: actual, cacheStoragePolicy: .notAllowed)
