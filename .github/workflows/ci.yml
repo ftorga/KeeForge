@@ -65,64 +65,13 @@ jobs:
           set -uo pipefail
           if [[ "$DIAGNOSTIC_SLICE" = cloud ]]; then
             selectors=(
-              CloudDatabaseSaverTests/testSaveTwofishDatabaseUploadsReparsableCipherPreservingBytes
-              CloudSyncCoordinatorTests/testDiscardCannotRetireAConflictedConfirmedDeliveryBeforeLocalReconciliation
-              CloudSyncCoordinatorTests/testDiscardConflictedPendingUploadsBacksUpLivePayloadAndDropsOnlyConflictedMarkers
-              CloudSyncCoordinatorTests/testDiscardConflictedPendingUploadsWithoutLivePayloadRetainsUnresolvedOwnership
-              CloudSyncCoordinatorTests/testExplicitSyncOfManualDatabaseStillFallsBackToCacheOffline
-              CloudSyncCoordinatorTests/testFirstDownloadDoesNotReplaceACacheCreatedDuringTheTransfer
-              CloudSyncCoordinatorTests/testJournalDeliveryRefusesRemovalUntilConfirmedOwnershipHasRetired
-              CloudSyncCoordinatorTests/testManualPolicyIsIgnoredForAnExplicitSync
-              CloudSyncCoordinatorTests/testManualPolicyOpensCachedCopyWithoutContactingTheProvider
-              CloudSyncCoordinatorTests/testManualPolicyStillDownloadsWhenNoCachedCopyExists
-              CloudSyncCoordinatorTests/testProbeThatTransfersContentIsNotCutOffByTheDeadline
-              CloudSyncCoordinatorTests/testSyncDeadlineCoversOnlyTheProbeNotTheDownload
-              CloudSyncCoordinatorTests/testSyncDownloadDoesNotRevertACacheWrittenDuringTheTransfer
-              CloudSyncCoordinatorTests/testSyncDownloadRetainsPendingCiphertextWithoutProviderIO
-              CloudSyncCoordinatorTests/testSyncDownloadsFreshCopyWhenRemoteMetadataChanges
-              CloudSyncCoordinatorTests/testSyncFallsBackToCachedCopyWhenOffline
-              CloudSyncCoordinatorTests/testSyncKeepsPreDownloadMetadataWhenTheTransportCannotReportIt
-              CloudSyncCoordinatorTests/testSyncOpensCachedCopyOfflineWhenProbeMissesDeadline
-              CloudSyncCoordinatorTests/testSyncRecordsRevisionReportedByTheDownloadItself
-              CloudSyncCoordinatorTests/testSyncReplacingAnExistingCacheLandsNewBytesAndLeavesNoStrayFiles
-              CloudSyncCoordinatorTests/testSyncReturnsCurrentWhenRemoteMetadataMatchesCachedCopy
-              CloudSyncCoordinatorTests/testSyncThrowsWhenCachedFallbackIsDisabled
-              CloudSyncCoordinatorTests/testSyncUsesCachedCopyWithErrorForNonOfflineFailures
-              CloudSyncCoordinatorTests/testSyncUsesDisconnectedCachedWhenAccountIsSignedOut
-              CloudSyncCoordinatorTests/testSyncUsesDisconnectedCachedWhenProviderIsUnavailable
-              CloudSyncCoordinatorTests/testSyncWaitsOutSlowProbeWhenCachedFallbackIsDisabled
-              CloudSyncCoordinatorTests/testSyncWaitsOutSlowProbeWhenNoCacheExists
-              CloudSyncCoordinatorTests/testTestContainerCleanupRemovesCachesWhoseActiveJournalRefusedReferenceRemoval
-              CloudSyncCoordinatorTests/testUnregisteredCloudResolutionCannotAdoptReferenceOrStartProviderIO
-              DatabaseCreationServiceTests/testCreateDropboxDatabaseDoesNotRegisterWhenUploadFails
               DatabaseViewModelCloudSyncTests/testAnOrdinarySaveRetainsTheConflictedSourceUntilExplicitOwnedMerge
-              DatabaseViewModelCloudSyncTests/testAuthenticatedMergeRejectsChangedSourcesTargetsAndReferenceBeforeEncryption
-              DatabaseViewModelCloudSyncTests/testAuthenticatedMergeRejectsForeignReferenceAndSecondInvocation
-              DatabaseViewModelCloudSyncTests/testAuthenticatedMergeRetainsNewSourceArrivingAfterInstalledOutput
               DatabaseViewModelCloudSyncTests/testCapturedMergeCannotWriteAfterAnotherWindowSettlesThenRekeysOrRemoves
-              DatabaseViewModelCloudSyncTests/testLockAndCancellationBeforeMergeSaverKeepSourcesAndPreventLateEffects
-              DatabaseViewModelCloudSyncTests/testLockingClearsThePendingUploadState
-              DatabaseViewModelCloudSyncTests/testMergePendingUploadsKeepsUnsavedEditsInTheUpload
-              DatabaseViewModelCloudSyncTests/testMergePendingUploadsRefusesARemoteRefIntoAFileTheUnsavedEditAdded
               DatabaseViewModelCloudSyncTests/testMergePendingUploadsThatHitANewerCloudCopySucceedsAfterSyncNow
               DatabaseViewModelCloudSyncTests/testMergePendingUploadsTransfersTheAutoFillChangeToDurableOwnerThenDelivers
               DatabaseViewModelCloudSyncTests/testMergePendingUploadsWhenTheCloudCopyChangedAgainKeepsTheMarker
-              DatabaseViewModelCloudSyncTests/testMergePendingUploadsWhoseUploadFailsKeepsTheMarker
-              DatabaseViewModelCloudSyncTests/testMergePendingUploadsWithAnUnprovenMarkerWritesNothingAndKeepsIt
-              DatabaseViewModelCloudSyncTests/testMergePendingUploadsWithAnUnreadableChangeWritesNothing
-              DatabaseViewModelCloudSyncTests/testMergePendingUploadsWithDivergedAttachmentsWritesNothing
-              DatabaseViewModelCloudSyncTests/testMergePendingUploadsWithTheChangeGoneFromTheDeviceWritesNothing
-              DatabaseViewModelCloudSyncTests/testOfflineKnownSaveCompletesSessionBookkeepingWithoutOptionalKeyPublicationOrRepeatedEncryption
-              DatabaseViewModelCloudSyncTests/testOldCloudOpenResolutionCannotOverwriteAConfirmedRekeyOrResurrectRemoval
               DatabaseViewModelCloudSyncTests/testOrdinaryConflictReadsRemoteWithoutOverwritingPendingCacheThenExplicitMergeDeliversAndSavesAgain
-              DatabaseViewModelCloudSyncTests/testPendingUploadConflictAvailabilityTracksReadOnlyChanges
-              DatabaseViewModelCloudSyncTests/testPendingUploadConflictIsNotOfferedForAReadOnlyDatabase
-              DatabaseViewModelCloudSyncTests/testPendingUploadConflictIsNotReportedWithoutAConflict
-              DatabaseViewModelCloudSyncTests/testSyncStatusBannerLeavesAConflictedUploadToTheConflictBanner
-              DatabaseViewModelCloudSyncTests/testUnconfirmedMergeOutputRetainsSourcesAndDoesNotAuthorizeConsumption
-              DatabaseViewModelCloudSyncTests/testValidCloudCacheUnlocksDuringUnavailableRecoveryButMutationAndKeyPublicationStayClosed
-              PendingUploadDrainerTests/testConfirmedRetirementRemovalFailureKeepsExactPayloadAndReconcilesWithoutProviderIO
-              PendingUploadDrainerTests/test_delivery_unknownSchemaAndUnreadableJournalFailClosedWithoutDroppingSource
+              DatabaseViewModelCloudSyncTests/testOldCloudOpenResolutionCannotOverwriteAConfirmedRekeyOrResurrectRemoval
             )
             if [[ "$TEST_SUITE" = KeeForgeTests ]]; then
               selectors+=(
