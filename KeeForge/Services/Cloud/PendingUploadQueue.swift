@@ -563,7 +563,7 @@ enum PendingUploadQueue {
         try withCommitLock(for: databaseID, environment: environment) {
             guard var owner = try readJournal(for: databaseID, environment: environment).last(where: {
                 $0.marker.isPayloadFinalized == true && $0.marker.intendedPayloadSHA512 == sha && $0.marker.intendedPayloadPath != nil
-            }) else { return }
+            }) else { throw SaveError.saveContextUnavailable }
             guard let current = DatabaseListStore.databases.first(where: { $0.id == databaseID }),
                   current.cloudSyncMetadata?.localHeadOperationID == owner.id,
                   current.cloudSyncMetadata?.keyEpoch == owner.marker.keyEpoch,
@@ -779,6 +779,7 @@ enum PendingUploadQueue {
     /// Caller holds the commit lock; marker and list locks are acquired only inside it.
     static func recoverLocalCommits(for databaseID: UUID, environment: Environment = .live) throws {
         for snapshot in try readJournal(for: databaseID, environment: environment) {
+            if snapshot.marker.journalVersion != nil { _ = try readImmutablePayload(snapshot, environment: environment) }
             let stored = try recoverPrepared(snapshot, environment: environment)
             switch try recoverLocalCommit(stored, environment: environment) {
             case .published, nil: break

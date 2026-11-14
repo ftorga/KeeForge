@@ -314,16 +314,24 @@ final class DatabaseViewModelCloudSyncTests: XCTestCase {
             let session = SymmetricKey(size: .bits256)
             let parsed = try KDBXParser.parseWithMeta(data: bytes, password: KDBXTestFixture.test.password, sessionKey: session)
             let draft = DatabaseDraft(rootGroup: parsed.rootGroup, meta: parsed.meta, sessionKey: session)
+            let mutationEffects = CloudJournalEffectCounter()
+            var mutation = context.environment()
+            let encrypt = mutation.encryptDraft
+            mutation.encryptDraft = { draft, key, header, policy in mutationEffects.record(); return try encrypt(draft, key, header, policy) }
+            let replace = mutation.replaceFile
+            mutation.replaceFile = { bytes, url, sha, reference in mutationEffects.record(); return try replace(bytes, url, sha, reference) }
             do {
                 _ = try await CloudDatabaseSaver.save(draft: draft, reference: reference,
                     compositeKey: KDBXTestFixture.test.compositeKey(in: Bundle(for: Self.self)),
                     openTimeSHA512: FileDigest.sha512(bytes), expectedRev: reference.expectedCloudRevision,
-                    environment: context.environment())
+                    environment: mutation)
                 XCTFail("Unavailable recovery cannot authorize another local mutation")
             } catch { XCTAssertTrue(error is CloudSaveRecoveryWarning || error is SaveError) }
+            XCTAssertEqual(mutationEffects.value, 0)
             let transport = CloudJournalTransport()
-            let outcome = await PendingUploadDrainer(environment: context.drainerEnvironment(saver: context.environment(transport: transport))).drainAll()
-            XCTAssertFalse(outcome.conflictDatabaseIDs.isEmpty)
+            let outcome = await PendingUploadDrainer(environment: context.drainerEnvironment(saver: context.environment(transport: transport))).drain(databaseId: reference.id)
+            XCTAssertTrue(outcome.drainedDatabaseIDs.isEmpty)
+            XCTAssertEqual(outcome.userIssue?.databaseId, reference.id)
             XCTAssertTrue(transport.effects.uploads.isEmpty)
             XCTAssertEqual(try Data(contentsOf: context.cacheURL), bytes)
             XCTAssertFalse(PendingUploadQueue.listMarkers(for: reference.id).isEmpty)

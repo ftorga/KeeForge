@@ -178,9 +178,16 @@ enum CloudDatabaseSaver {
                 environment: environment
             )
         }.value } catch {
-            let requiresRecovery = (try? PendingUploadQueue.readJournal(for: reference.id, environment: environment.queue).contains {
-                [.prepared, .attempting, .confirmed, .recoveryRequired, .invalid].contains(CloudJournalDecision.state(of: $0.marker)) || $0.marker.keyChange != nil
-            }) ?? true
+            let requiresRecovery: Bool
+            do {
+                let journal = try PendingUploadQueue.readJournal(for: reference.id, environment: environment.queue)
+                for stored in journal where stored.marker.journalVersion != nil {
+                    _ = try PendingUploadQueue.readImmutablePayload(stored, environment: environment.queue)
+                }
+                requiresRecovery = journal.contains {
+                    [.prepared, .attempting, .confirmed, .recoveryRequired, .invalid].contains(CloudJournalDecision.state(of: $0.marker)) || $0.marker.keyChange != nil
+                }
+            } catch { requiresRecovery = true }
             if requiresRecovery { throw CloudSaveRecoveryWarning() }
             throw error
         }
