@@ -255,6 +255,60 @@ final class PendingUploadDrainerTests: XCTestCase {
         XCTAssertEqual(sources.map(\.data), [bytes])
     }
 
+    func testThreeConfirmedAncestorsRetireWithoutReplacingTheCurrentDescendantOrResending() async throws {
+        let first = try makeContext()
+        let referenceB = try XCTUnwrap(DatabaseListStore.databases.first { $0.id == first.reference.id })
+        let second = try CloudJournalTestContext(reference: referenceB, base: first.payload, payload: Data("ciphertext-C".utf8))
+        let referenceC = try XCTUnwrap(DatabaseListStore.databases.first { $0.id == first.reference.id })
+        let third = try CloudJournalTestContext(reference: referenceC, base: second.payload, payload: Data("ciphertext-D".utf8))
+        let owners = [first, second, third]
+        for (index, owner) in owners.enumerated() {
+            let transport = CloudJournalTransport(remote: owner.base, revision: "remote-\(index)",
+                response: .init(modifiedDate: .now, contentHash: nil, size: Int64(owner.payload.count), rev: "remote-\(index + 1)"))
+            let environment = owner.environment(transport: transport)
+            guard case .saved? = try await CloudDatabaseSaver.deliver(owner.stored, reference: owner.reference, environment: environment) else {
+                return XCTFail("Verified ancestry must reconcile without rolling back its descendant")
+            }
+            XCTAssertEqual(transport.effects.uploads, [.init(bytes: owner.payload, revision: "remote-\(index)")])
+            XCTAssertEqual(try Data(contentsOf: third.cacheURL), third.payload)
+            let remaining = try PendingUploadQueue.readJournal(for: first.reference.id)
+            XCTAssertEqual(Set(remaining.map(\.id)), Set(owners.dropFirst(index + 1).map { $0.stored.id }))
+            if let child = remaining.first(where: { $0.marker.predecessorOperationID == owner.stored.id }) {
+                XCTAssertEqual(child.marker.remoteBaseSHA512, FileDigest.sha512(owner.payload))
+                XCTAssertEqual(child.marker.expectedRev, "remote-\(index + 1)")
+            }
+            let lateCompletion = try await CloudDatabaseSaver.deliver(owner.stored, reference: owner.reference, environment: environment)
+            XCTAssertNil(lateCompletion)
+            XCTAssertEqual(transport.effects.uploads.count, 1)
+        }
+        XCTAssertTrue(try PendingUploadQueue.readJournal(for: first.reference.id).isEmpty)
+        XCTAssertEqual(DatabaseListStore.databases.first { $0.id == first.reference.id }?.cloudSyncMetadata?.localHeadOperationID, third.stored.id)
+    }
+
+    func testConfirmedRetirementRemovalFailureKeepsExactPayloadAndReconcilesWithoutProviderIO() async throws {
+        let context = try makeContext()
+        let transport = CloudJournalTransport()
+        var faulty = context.environment(transport: transport)
+        let remove = faulty.queue.removeItem
+        faulty.queue.removeItem = { url in
+            if url == context.stored.fileURL { throw CocoaError(.fileWriteNoPermission) }
+            try remove(url)
+        }
+        do {
+            _ = try await CloudDatabaseSaver.deliver(context.stored, reference: context.reference, environment: faulty)
+            XCTFail("A failed journal retirement cannot report complete")
+        } catch { XCTAssertEqual((error as? CocoaError)?.code, .fileWriteNoPermission) }
+        let confirmed = try XCTUnwrap(PendingUploadQueue.readJournal(for: context.reference.id).first)
+        XCTAssertEqual(CloudJournalDecision.state(of: confirmed.marker), .confirmed)
+        XCTAssertEqual(try PendingUploadQueue.readImmutablePayload(confirmed), context.payload)
+        XCTAssertEqual(try Data(contentsOf: context.cacheURL), context.payload)
+        guard case .saved? = try await CloudDatabaseSaver.deliver(confirmed, reference: context.reference,
+            environment: context.environment(transport: transport)) else { return XCTFail("Explicit confirmation recovery must finish locally") }
+        XCTAssertEqual(transport.effects.uploads.count, 1)
+        XCTAssertTrue(try PendingUploadQueue.readJournal(for: context.reference.id).isEmpty)
+        XCTAssertEqual(try Data(contentsOf: context.cacheURL), context.payload)
+    }
+
     func test_drain_confirmedFollowUpReconcilesWithoutUploadingAgain() async throws {
         let context = try makeContext()
         let transport = CloudJournalTransport()

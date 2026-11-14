@@ -14,7 +14,8 @@ struct CloudJournalTestContext: Sendable {
         self.reference = reference
         self.base = base
         self.payload = payload
-        try DatabaseListStore.cacheDatabaseCopy(base, for: reference)
+        let existing = try? Data(contentsOf: DatabaseListStore.cacheLocation(for: reference))
+        if existing != base { try DatabaseListStore.cacheDatabaseCopy(base, for: reference) }
         stored = try PendingUploadQueue.withCommitLock(for: reference.id) {
             let prepared = try PendingUploadQueue.prepare(reference: reference, currentData: base,
                 intendedData: payload, cacheURL: DatabaseListStore.cacheLocation(for: reference))
