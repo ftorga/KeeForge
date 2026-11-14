@@ -26,6 +26,55 @@ final class DatabaseViewModelCloudSyncTests: XCTestCase {
         try await super.tearDown()
     }
 
+    func testOfflineKnownSaveCompletesSessionBookkeepingWithoutOptionalKeyPublicationOrRepeatedEncryption() async throws {
+        let bytes = try KDBXTestFixture.test.data(in: Bundle(for: Self.self))
+        let reference = try makeStoredManualReference(fileID: "/queued-save.kdbx", autoFillEnabled: false)
+        try DatabaseListStore.cacheDatabaseCopy(bytes, for: reference)
+        let encrypted = CloudJournalEffectCounter()
+        let replacements = CloudJournalEffectCounter()
+        let keyEffects = CloudJournalEffectCounter()
+        let uploads = CloudJournalEffectCounter()
+        var environment = CloudDatabaseSaver.Environment.live
+        environment.beginBackgroundTask = { _ in .invalid }
+        environment.endBackgroundTask = { _ in }
+        let encrypt = environment.encryptDraft
+        environment.encryptDraft = { draft, key, header, policy in encrypted.record(); return try encrypt(draft, key, header, policy) }
+        let replace = environment.replaceFile
+        environment.replaceFile = { bytes, url, sha, ref in replacements.record(); return try replace(bytes, url, sha, ref) }
+        environment.upload = { _, _, _, _ in uploads.record(); throw CloudProviderError.networkUnavailable }
+        let saver = environment
+        let vm = DatabaseViewModel(databaseReference: reference,
+            cloudSyncOperation: { reference, _ in
+                try await CloudSyncCoordinator.syncIfNeededForOpen(reference: reference, providerResolver: { _ in nil })
+            }, cloudSaveOperation: { draft, reference, key, sha, remoteSHA, rev, newKey, settings in
+                try await CloudDatabaseSaver.save(draft: draft, reference: reference, compositeKey: key,
+                    openTimeSHA512: sha, reconciledRemoteSHA512: remoteSHA, expectedRev: rev,
+                    kdfPolicy: .mainApp, newCompositeKey: newKey, encryptionSettings: settings, environment: saver)
+            }, quickUnlockKeyPersistOperation: { _, _, _ in false },
+            expressUnlockKeySaveOperation: { _, _ in keyEffects.record() })
+        await vm.unlock(password: fixturePassword)
+        defer { vm.lock() }
+        try vm.applyEntryEdit(.createEntry(parentGroupID: XCTUnwrap(vm.visibleRootGroupID),
+            draft: EntryDraftPayload(title: "Durably queued edit", password: "queued")))
+        try await vm.save()
+        XCTAssertFalse(vm.isDirty)
+        XCTAssertNil(vm.saveError)
+        let installed = try Data(contentsOf: DatabaseListStore.cacheLocation(for: reference))
+        let reopened = try KDBXParser.parseWithMeta(data: installed, password: fixturePassword, sessionKey: SymmetricKey(size: .bits256))
+        XCTAssertTrue(reopened.rootGroup.allEntries.contains { $0.title == "Durably queued edit" })
+        XCTAssertEqual(vm.openTimeSHA512, FileDigest.sha512(installed))
+        let pending = try XCTUnwrap(PendingUploadQueue.readJournal(for: reference.id).first)
+        XCTAssertEqual(try PendingUploadQueue.readImmutablePayload(pending), installed)
+        XCTAssertEqual(CloudJournalDecision.state(of: pending.marker), .ready)
+        XCTAssertEqual(keyEffects.value, 0)
+        XCTAssertEqual(uploads.value, 0)
+        XCTAssertEqual(encrypted.value, 1)
+        XCTAssertEqual(replacements.value, 1)
+        try await vm.save()
+        XCTAssertEqual(encrypted.value, 1)
+        XCTAssertEqual(replacements.value, 1)
+    }
+
     func testCloudReadPublicationDeadlineKeepsMainActorResponsiveAndNeverReopensClosedPermission() async throws {
         let bytes = try KDBXTestFixture.test.data(in: Bundle(for: Self.self))
         for claimFirst in [false, true] {

@@ -3128,6 +3128,11 @@ final class DatabaseViewModel {
         let effect = expressUnlockKeySaveOperation
         let desired = quickUnlockItemHoldsSessionKey ? key : nil
         do {
+            let hasQueuedDelivery = try await CoordinatedFileReader.performBlocking(timeout: keyCommitPublicationTimeout) {
+                try PendingUploadQueue.readJournal(for: reference.id).isEmpty == false
+            }
+            // The journal owns queued ciphertext; optional express-key refresh waits for delivery.
+            if hasQueuedDelivery { return }
             try await publishCloudKeyEffect(reference: reference, sha512: sha512, actionID: actionID) {
                 effect(desired, reference)
             }
