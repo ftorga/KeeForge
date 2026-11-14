@@ -720,6 +720,7 @@ final class DatabaseViewModelCloudSyncTests: XCTestCase {
             }, quickUnlockKeyPersistOperation: { _, _, _ in effects.record(); return true })
             let opening = Task { await vm.unlock(password: KDBXTestFixture.test.password); completed.fulfill() }
             let entry = await XCTWaiter.fulfillment(of: [entered], timeout: 30)
+            var openingJoined = false
             do {
                 guard entry == .completed else { XCTFail("Old open never reached its captured resolution"); throw WaitTimedOut() }
                 let session = SymmetricKey(size: .bits256)
@@ -766,6 +767,7 @@ final class DatabaseViewModelCloudSyncTests: XCTestCase {
                     XCTFail("Old cloud unlock did not complete after its only gate was released")
                     fatalError("Old cloud unlock failed to join after releasing its only test gate")
                 }
+                openingJoined = true
                 await opening.value
                 if removeAfterRekey { XCTAssertNil(DatabaseListStore.databases.first { $0.id == reference.id }) }
                 else { XCTAssertEqual(DatabaseListStore.databases.first { $0.id == reference.id }, committed) }
@@ -802,10 +804,12 @@ final class DatabaseViewModelCloudSyncTests: XCTestCase {
                 vm.lock()
                 opening.cancel()
                 release.continuation.finish()
-                let joined = await XCTWaiter.fulfillment(of: [completed], timeout: 30)
-                if joined != .completed {
-                    XCTFail("Cloud open cleanup did not join the complete task after cancellation and gate release")
-                    fatalError("Cloud open regression cannot clear stores beneath an unquiesced worker")
+                if !openingJoined {
+                    let joined = await XCTWaiter.fulfillment(of: [completed], timeout: 30)
+                    if joined != .completed {
+                        XCTFail("Cloud open cleanup did not join the complete task after cancellation and gate release")
+                        fatalError("Cloud open regression cannot clear stores beneath an unquiesced worker")
+                    }
                 }
                 await opening.value
                 vm.lock()
