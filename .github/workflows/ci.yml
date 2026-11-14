@@ -6,6 +6,14 @@ on:
         description: Exact source commit SHA (diagnostic evidence only)
         required: true
         default: '480ba7cb6baf73788fc3892bbe8bc29aeb9f15a6'
+      slice:
+        description: Diagnostic selection (not a required PR gate)
+        type: choice
+        required: true
+        default: local
+        options:
+          - local
+          - cloud
 permissions:
   contents: read
 jobs:
@@ -27,6 +35,7 @@ jobs:
       TEST_SUITE: '${{ matrix.suite }}'
       DESTINATION: '${{ matrix.destination }}'
       SOURCE_SHA: '${{ inputs.source_ref }}'
+      DIAGNOSTIC_SLICE: '${{ inputs.slice || 'local' }}'
     steps:
       - uses: actions/checkout@v7
         with:
@@ -50,16 +59,38 @@ jobs:
         run: BOOTSTRAP_LOCAL_CONFIG_FROM_ENV=1 ./ci_scripts/prepare_build_config.sh .
       - name: Generate project
         run: xcodegen generate
-      - name: Execute exact failing selectors once
+      - name: Execute selected diagnostic slice once
         run: |
           set -uo pipefail
-          selectors=(
-            DatabaseListStoreTests/testNoRenewResolutionKeepsRegistryCacheAndOwnerUntouchedForBrokenTrashAndMovedBookmarks
-            DatabaseViewModelTests/testRekeyDuringLocalReadPublicationDoesNotRestoreTheOldUnlockFactor
-            PendingLocalSaveTests/testMergeWhoseSaveConflictsKeepsThePendingSave
-            PendingLocalSaveTests/testMovedPendingSourceDefersRenewalUntilMergeAndLeavesFutureSaveAndRekeyUsable
-            PendingLocalSaveTests/testRenewalDefersForRecordedAndFilesystemSourcesAndUnresolvedOwnership
-          )
+          if [[ "$DIAGNOSTIC_SLICE" = cloud ]]; then
+            selectors=(
+              CloudDatabaseSaverTests
+              PendingUploadDrainerTests
+              CloudSyncCoordinatorTests
+              DatabaseCreationServiceTests
+              CredentialProviderSaveTests
+              CredentialProviderRegistrationTests
+              DatabaseListViewModelTests
+              QuickUnlockPasswordIntervalTests
+              DatabaseViewModelCloudSyncTests/testValidCloudCacheUnlocksDuringUnavailableRecoveryButMutationAndKeyPublicationStayClosed
+              DatabaseViewModelCloudSyncTests/testCloudReadPublicationDeadlineKeepsMainActorResponsiveAndNeverReopensClosedPermission
+              CredentialProviderCoordinatorTests/test_cloudRecoveryFailureStillUnlocksAndFillsTheAuthenticatedCacheWithoutPublishingKeys
+            )
+            if [[ "$TEST_SUITE" = KeeForgeTests ]]; then
+              selectors+=(
+                DropboxCloudProviderTests/testSDKAcceptedUploadWithLost503RetainsAttemptWithoutSecondRequest
+                DropboxCloudProviderTests/testSDKCreateLost503AndInitialConflictKeepNilIdentityWithoutRetryOrDelete
+              )
+            fi
+          else
+            selectors=(
+              DatabaseListStoreTests/testNoRenewResolutionKeepsRegistryCacheAndOwnerUntouchedForBrokenTrashAndMovedBookmarks
+              DatabaseViewModelTests/testRekeyDuringLocalReadPublicationDoesNotRestoreTheOldUnlockFactor
+              PendingLocalSaveTests/testMergeWhoseSaveConflictsKeepsThePendingSave
+              PendingLocalSaveTests/testMovedPendingSourceDefersRenewalUntilMergeAndLeavesFutureSaveAndRekeyUsable
+              PendingLocalSaveTests/testRenewalDefersForRecordedAndFilesystemSourcesAndUnresolvedOwnership
+            )
+          fi
           selection=()
           for selector in "${selectors[@]}"; do
             selection+=("-only-testing:$TEST_SUITE/$selector")
@@ -81,7 +112,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: 'focused-${{ matrix.suite }}'
+          name: '${{ inputs.slice || 'local' }}-focused-${{ matrix.suite }}'
           path: |
             build/*.txt
             build/*.json
