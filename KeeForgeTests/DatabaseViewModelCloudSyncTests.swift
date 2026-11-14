@@ -1083,7 +1083,9 @@ final class DatabaseViewModelCloudSyncTests: XCTestCase {
                     XCTAssertEqual(fresh.openTimeSHA512, FileDigest.sha512(bytes))
                     XCTAssertEqual(freshEffects.value, 1, "No permanent rollback pin is introduced")
                     let afterFresh = try XCTUnwrap(DatabaseListStore.databases.first { $0.id == reference.id })
-                    XCTAssertEqual(afterFresh.cloudSyncMetadata, committed.cloudSyncMetadata)
+                    var expectedMetadata = committed.cloudSyncMetadata
+                    expectedMetadata?.lastSyncIssue = .notAuthenticated
+                    XCTAssertEqual(afterFresh.cloudSyncMetadata, expectedMetadata)
                     XCTAssertEqual(afterFresh.lastMasterKeyChangeAt, committed.lastMasterKeyChangeAt)
                     XCTAssertEqual(afterFresh.keyFileBookmarkData, committed.keyFileBookmarkData)
                     XCTAssertNil(afterFresh.legacyKeychainFilename, "Only the fresh admitted publication may clear legacy metadata")
