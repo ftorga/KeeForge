@@ -700,10 +700,109 @@ final class DatabaseViewModelCloudSyncTests: XCTestCase {
         XCTAssertEqual(keyEffects.value, 0)
     }
 
+    private func joinCloudRefresh(_ worker: Task<Void, Never>, vm: DatabaseViewModel) async throws {
+        let completed = XCTestExpectation(description: "foreground worker completed")
+        let cleanupCompleted = XCTestExpectation(description: "foreground worker completed after cleanup")
+        let joining = Task { await worker.value; completed.fulfill(); cleanupCompleted.fulfill() }
+        let result = await XCTWaiter.fulfillment(of: [completed], timeout: 30)
+        if result != .completed {
+            vm.lock()
+            worker.cancel()
+            let cleanup = await XCTWaiter.fulfillment(of: [cleanupCompleted], timeout: 30)
+            guard cleanup == .completed else {
+                XCTFail("Foreground metadata worker did not terminate after cancellation")
+                // An unquiesced worker must not outlive teardown of its shared test store.
+                fatalError("Unquiesced foreground metadata regression worker")
+            }
+            await joining.value
+            throw WaitTimedOut()
+        }
+        await joining.value
+    }
+
+    func testPublishedCloudReadMetadataDoesNotImportConcurrentReferenceFields() async throws {
+        let bytes = try fixtureData()
+        let reference = try makeStoredManualReference(fileID: "/metadata-only.kdbx", autoFillEnabled: false)
+        try DatabaseListStore.cacheDatabaseCopy(bytes, for: reference)
+        let remote = InMemoryRemoteProvider(bytes: bytes, rev: "rev-A")
+        let effects = CloudJournalEffectCounter()
+        let vm = DatabaseViewModel(databaseReference: reference, cloudSyncOperation: { ref, _ in
+            try await CloudSyncCoordinator.syncIfNeededForOpen(reference: ref, providerResolver: { _ in remote })
+        }, cloudRefreshOperation: { ref, _ in
+            let resolution = try await CloudSyncCoordinator.syncIfNeededForOpen(reference: ref,
+                honorsManualSyncPolicy: false, providerResolver: { _ in remote })
+            var current = try XCTUnwrap(DatabaseListStore.databases.first { $0.id == ref.id })
+            current.nickname = "Concurrent window nickname"
+            DatabaseListStore.update(current)
+            return resolution
+        }, quickUnlockKeyPersistOperation: { _, _, _ in effects.record(); return false })
+        defer { vm.lock() }
+        await vm.unlock(password: fixturePassword)
+        let historical = vm.databaseReference
+        let beforeEffects = effects.value
+        _ = try remote.store(bytes, expectedRev: "rev-A")
+        await vm.syncCloudNow()
+        let current = try XCTUnwrap(DatabaseListStore.databases.first { $0.id == reference.id })
+        XCTAssertEqual(vm.databaseReference.cloudSyncMetadata, current.cloudSyncMetadata)
+        XCTAssertEqual(current.cloudSyncMetadata?.remoteRev, remote.currentMetadata.rev)
+        XCTAssertEqual(current.nickname, "Concurrent window nickname")
+        XCTAssertEqual(vm.databaseReference.nickname, historical.nickname)
+        XCTAssertEqual(vm.databaseReference.keyFileBookmarkData, historical.keyFileBookmarkData)
+        XCTAssertEqual(vm.databaseReference.lastMasterKeyChangeAt, historical.lastMasterKeyChangeAt)
+        XCTAssertEqual(vm.openTimeSHA512, FileDigest.sha512(bytes))
+        XCTAssertEqual(try Data(contentsOf: DatabaseListStore.cacheLocation(for: reference)), bytes)
+        XCTAssertEqual(effects.value, beforeEffects)
+        XCTAssertEqual(vm.cloudSyncOutcome, .upToDate)
+    }
+
+    func testCloudMetadataWriteFailureLeavesSyncAndForegroundHistoricalAndCacheReadable() async throws {
+        let bytes = try fixtureData()
+        var reference = try makeStoredManualReference(fileID: "/metadata-write-failure.kdbx", autoFillEnabled: false)
+        reference.cloudSyncPolicy = .onOpen
+        DatabaseListStore.update(reference)
+        try DatabaseListStore.cacheDatabaseCopy(bytes, for: reference)
+        let effects = CloudJournalEffectCounter()
+        let vm = DatabaseViewModel(databaseReference: reference, cloudSyncOperation: { ref, _ in
+            try await CloudSyncCoordinator.syncIfNeededForOpen(reference: ref, providerResolver: { _ in nil })
+        }, cloudRefreshOperation: { ref, _ in
+            try await CloudSyncCoordinator.syncIfNeededForOpen(reference: ref, honorsManualSyncPolicy: false,
+                providerResolver: { _ in nil })
+        }, quickUnlockKeyPersistOperation: { _, _, _ in effects.record(); return false })
+        defer { vm.lock() }
+        await vm.unlock(password: fixturePassword)
+        XCTAssertEqual(vm.state, .unlocked)
+        let historical = vm.databaseReference
+        let initialEffects = effects.value
+        let registry = AppGroupContainer.url.appendingPathComponent("database-list.json")
+        let retained = registry.deletingLastPathComponent().appendingPathComponent("metadata-registry-\(UUID().uuidString).json")
+        let registryBytes = try Data(contentsOf: registry)
+        try FileManager.default.moveItem(at: registry, to: retained)
+        try FileManager.default.createDirectory(at: registry, withIntermediateDirectories: false)
+        defer {
+            do {
+                try FileManager.default.removeItem(at: registry)
+                try FileManager.default.moveItem(at: retained, to: registry)
+                XCTAssertEqual(try Data(contentsOf: registry), registryBytes)
+            } catch { XCTFail("Unable to restore the owned registry fault fixture") }
+        }
+        await vm.syncCloudNow()
+        XCTAssertEqual(vm.databaseReference, historical)
+        let worker = try XCTUnwrap(vm.refreshSharedDatabaseCacheIfPossible())
+        try await joinCloudRefresh(worker, vm: vm)
+        XCTAssertEqual(vm.databaseReference, historical)
+        XCTAssertEqual(vm.state, .unlocked)
+        XCTAssertEqual(vm.openTimeSHA512, FileDigest.sha512(bytes))
+        XCTAssertEqual(try Data(contentsOf: DatabaseListStore.cacheLocation(for: reference)), bytes)
+        XCTAssertTrue(try registry.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true)
+        XCTAssertEqual(try Data(contentsOf: retained), registryBytes)
+        XCTAssertEqual(effects.value, initialEffects)
+    }
+
     func testOldCloudOpenResolutionCannotOverwriteAConfirmedRekeyOrResurrectRemoval() async throws {
         let bytes = try KDBXTestFixture.test.data(in: Bundle(for: Self.self))
         for removeAfterRekey in [false, true] {
             var reference = try makeStoredManualReference(fileID: "/late-open-\(removeAfterRekey).kdbx", autoFillEnabled: false)
+            reference.cloudSyncPolicy = .onOpen
             reference.legacyKeychainFilename = "old-open-\(UUID().uuidString).kdbx"
             DatabaseListStore.update(reference)
             let capturedReference = reference
@@ -717,6 +816,9 @@ final class DatabaseViewModelCloudSyncTests: XCTestCase {
                 entered.fulfill()
                 for await _ in release.stream { break }
                 return resolution
+            }, cloudRefreshOperation: { ref, _ in
+                try await CloudSyncCoordinator.syncIfNeededForOpen(reference: ref, honorsManualSyncPolicy: false,
+                    providerResolver: { _ in nil })
             }, quickUnlockKeyPersistOperation: { _, _, _ in effects.record(); return true })
             let opening = Task { await vm.unlock(password: KDBXTestFixture.test.password); completed.fulfill() }
             let entry = await XCTWaiter.fulfillment(of: [entered], timeout: 30)
@@ -780,6 +882,17 @@ final class DatabaseViewModelCloudSyncTests: XCTestCase {
                     XCTAssertEqual(vm.openTimeSHA512, FileDigest.sha512(bytes))
                     XCTAssertEqual(DatabaseListStore.databases.first { $0.id == reference.id }?.legacyKeychainFilename,
                         committed.legacyKeychainFilename, "Rejected publication must not run legacy registry cleanup")
+                    let historical = vm.databaseReference
+                    await vm.syncCloudNow()
+                    XCTAssertEqual(vm.databaseReference, historical, "Offline Sync Now cannot import the fallback's B tuple")
+                    XCTAssertEqual(effects.value, 0)
+                    XCTAssertEqual(DatabaseListStore.databases.first { $0.id == reference.id }, committed)
+                    let foreground = try XCTUnwrap(vm.refreshSharedDatabaseCacheIfPossible())
+                    try await joinCloudRefresh(foreground, vm: vm)
+                    XCTAssertEqual(vm.databaseReference, historical, "Automatic foreground fallback cannot import B authority")
+                    XCTAssertEqual(effects.value, 0)
+                    XCTAssertEqual(try Data(contentsOf: DatabaseListStore.cacheLocation(for: committed)), bytes)
+                    XCTAssertEqual(DatabaseListStore.databases.first { $0.id == reference.id }, committed)
                     let freshEffects = CloudJournalEffectCounter()
                     let fresh = DatabaseViewModel(databaseReference: committed, cloudSyncOperation: { ref, _ in
                         try await CloudSyncCoordinator.syncIfNeededForOpen(reference: ref, providerResolver: { _ in nil })
@@ -798,6 +911,15 @@ final class DatabaseViewModelCloudSyncTests: XCTestCase {
                     XCTAssertEqual(afterFresh.lastMasterKeyChangeAt, committed.lastMasterKeyChangeAt)
                     XCTAssertEqual(afterFresh.keyFileBookmarkData, committed.keyFileBookmarkData)
                     XCTAssertNil(afterFresh.legacyKeychainFilename, "Only the fresh admitted publication may clear legacy metadata")
+                } else {
+                    let historical = vm.databaseReference
+                    await vm.syncCloudNow()
+                    let foreground = try XCTUnwrap(vm.refreshSharedDatabaseCacheIfPossible())
+                    try await joinCloudRefresh(foreground, vm: vm)
+                    XCTAssertEqual(vm.databaseReference, historical)
+                    XCTAssertNil(DatabaseListStore.databases.first { $0.id == reference.id })
+                    XCTAssertFalse(FileManager.default.fileExists(atPath: DatabaseListStore.cacheLocation(for: reference).path))
+                    XCTAssertEqual(effects.value, 0)
                 }
                 vm.lock()
             } catch {

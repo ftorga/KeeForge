@@ -4193,11 +4193,11 @@ final class DatabaseViewModel {
         // revision shows it, and merging the response's metadata ahead of
         // the save's own would keep the save's revision from being recorded.
         var observedOpenTimeSHA512: Data?
-        var observedCloudMetadata: CloudSyncMetadata?
+        var observedReference: DatabaseReference
         var resolution: CloudSyncResolution
         repeat {
             observedOpenTimeSHA512 = openTimeSHA512
-            observedCloudMetadata = databaseReference.cloudSyncMetadata
+            observedReference = databaseReference
             do {
                 resolution = try await cloudRefreshOperation(databaseReference) { _ in }
             } catch {
@@ -4210,23 +4210,14 @@ final class DatabaseViewModel {
             guard lockCycleID == expectedLockCycleID else { return }
         } while openTimeSHA512 != observedOpenTimeSHA512
 
-        // Same metadata-only merge as the foreground refresh: a save that
-        // landed during the round-trip must not be rolled back.
-        if resolution.pendingUploadSources.isEmpty, let observedCloudMetadata,
-           let learned = resolution.reference.cloudSyncMetadata,
-           let mergedReference = DatabaseListStore.updateCloudSyncMetadata(
-               for: resolution.reference.id,
-               ifUnchangedFrom: observedCloudMetadata,
-               mutate: { storedMetadata in
-                   storedMetadata.remoteContentHash = learned.remoteContentHash
-                   storedMetadata.remoteModifiedAt = learned.remoteModifiedAt
-                   storedMetadata.remoteRev = learned.remoteRev
-                   storedMetadata.lastSyncedAt = learned.lastSyncedAt
-                   storedMetadata.lastSyncIssue = learned.lastSyncIssue
-               }
-           ) {
-            databaseReference = mergedReference
-        }
+        let capturedReference = observedReference
+        guard expectedLockCycleID == lockCycleID, databaseReference == capturedReference else { return }
+        let mergedReference = await Task.detached { [resolution] in
+            Self.publishCloudReadMetadata(resolution, observed: capturedReference)
+        }.value
+        guard expectedLockCycleID == lockCycleID, databaseReference == capturedReference,
+              openTimeSHA512 == observedOpenTimeSHA512 else { return }
+        if let mergedReference { databaseReference = mergedReference }
         cloudSyncBannerText = resolution.bannerMessage
         hasPendingCloudUploads = pendingUploadMarkerCheck(databaseReference)
 
@@ -4472,19 +4463,19 @@ final class DatabaseViewModel {
         }
     }
 
-    func refreshSharedDatabaseCacheIfPossible() {
+    @discardableResult
+    func refreshSharedDatabaseCacheIfPossible() -> Task<Void, Never>? {
         let expectedLockCycleID = lockCycleID
         let databaseReference = self.databaseReference
         if databaseReference.isCloudBacked, databaseReference.cloudSyncPolicy == .manual {
-            return
+            return nil
         }
         // See `cacheDatabaseCopyForLocalDatabase`.
         if databaseReference.isCloudBacked == false,
            PendingLocalSaveStore.hasSaves(for: databaseReference.id) {
-            Task {
-                await mergePendingLocalSaves()
+            return Task {
+                _ = await mergePendingLocalSaves()
             }
-            return
         }
         let compositeKeyForStoreRefresh: SymmetricKey?
 
@@ -4496,13 +4487,17 @@ final class DatabaseViewModel {
             compositeKeyForStoreRefresh = nil
         }
 
-        Task.detached(priority: .utility) {
+        return Task.detached(priority: .utility) {
             do {
                 let fingerprint = databaseReference.isCloudBacked
                     ? nil
                     : try Self.makeSharedCacheRefreshFingerprint(for: databaseReference)
                 let refreshStart = Date.now
                 let shouldRefresh = await MainActor.run { () -> Bool in
+                    if databaseReference.isCloudBacked {
+                        guard self.lockCycleID == expectedLockCycleID,
+                              self.databaseReference == databaseReference else { return false }
+                    }
                     guard self.isRefreshingSharedCache == false else { return false }
                     if let fingerprint {
                         guard self.lastSharedCacheRefreshFingerprint != fingerprint else { return false }
@@ -4523,40 +4518,17 @@ final class DatabaseViewModel {
                 let data: Data
 
                 if databaseReference.isCloudBacked {
-                    let observedCloudMetadata = databaseReference.cloudSyncMetadata
                     let resolution = try await CloudSyncCoordinator.syncIfNeededForOpen(reference: databaseReference)
                     data = resolution.data
-
-                    // Storing `resolution.reference` wholesale would revert a
-                    // save or drain that landed during the round-trip, and the
-                    // next save would conflict against the app's own upload.
-                    // Merge only the sync fields learned here, and only while
-                    // the stored state is unchanged (see
-                    // `DatabaseListStore.updateCloudSyncMetadata`).
-                    let mergedReference = observedCloudMetadata.flatMap { observed in
-                        DatabaseListStore.updateCloudSyncMetadata(
-                            for: resolution.reference.id,
-                            ifUnchangedFrom: observed
-                        ) { storedMetadata in
-                            guard let learned = resolution.reference.cloudSyncMetadata else { return }
-                            storedMetadata.remoteContentHash = learned.remoteContentHash
-                            storedMetadata.remoteModifiedAt = learned.remoteModifiedAt
-                            storedMetadata.remoteRev = learned.remoteRev
-                            storedMetadata.lastSyncedAt = learned.lastSyncedAt
-                            storedMetadata.lastSyncIssue = learned.lastSyncIssue
-                        }
-                    }
-
-                    await MainActor.run {
-                        guard self.databaseReference.id == resolution.reference.id else { return }
+                    let mergedReference = Self.publishCloudReadMetadata(resolution, observed: databaseReference)
+                    let accepted = await MainActor.run { () -> Bool in
+                        guard self.lockCycleID == expectedLockCycleID,
+                              self.databaseReference == databaseReference else { return false }
                         self.cloudSyncBannerText = resolution.bannerMessage
-                        // Nil means skipped or unpersisted: keep the current
-                        // reference so the next sync redoes the work rather
-                        // than trusting an unsaved rev.
-                        if let mergedReference {
-                            self.databaseReference = mergedReference
-                        }
+                        if let mergedReference { self.databaseReference = mergedReference }
+                        return true
                     }
+                    guard accepted else { return }
                 } else {
                     let lease = try PendingLocalSaveStore.captureCacheReadLease(for: databaseReference)
                     guard let url = DatabaseListStore.resolveDatabaseURL(for: databaseReference, renewBookmark: false) else { return }
@@ -5357,6 +5329,36 @@ final class DatabaseViewModel {
         return try await syncCloudCopyForOpen(progressID: progressID)
     }
 
+    nonisolated private static func publishCloudReadMetadata(
+        _ resolution: CloudSyncResolution, observed: DatabaseReference
+    ) -> DatabaseReference? {
+        guard resolution.pendingUploadSources.isEmpty, resolution.reference.id == observed.id,
+              let baseline = observed.cloudSyncMetadata,
+              let learned = resolution.reference.cloudSyncMetadata else { return nil }
+        let update = DatabaseListStore.compareAndUpdateCloudSyncMetadata(for: observed.id, ifUnchangedFrom: baseline) {
+            $0.remoteContentHash = learned.remoteContentHash
+            $0.remoteModifiedAt = learned.remoteModifiedAt
+            $0.remoteRev = learned.remoteRev
+            $0.lastSyncedAt = learned.lastSyncedAt
+            $0.lastSyncIssue = learned.lastSyncIssue
+        }
+        switch update {
+        case .published:
+            var reference = observed
+            reference.updateCloudSyncMetadata {
+                $0.remoteContentHash = learned.remoteContentHash
+                $0.remoteModifiedAt = learned.remoteModifiedAt
+                $0.remoteRev = learned.remoteRev
+                $0.lastSyncedAt = learned.lastSyncedAt
+                $0.lastSyncIssue = learned.lastSyncIssue
+            }
+            return reference
+        case .mismatch, .removed, .writeFailed:
+            // Bytes already read cannot borrow a newer reference's authority after a rejected CAS.
+            return nil
+        }
+    }
+
     private func readDatabaseData(
         prefetchedCloudResolution: CloudSyncResolution? = nil
     ) async throws -> (url: URL, data: Data, cloudSyncStatus: CloudSyncResolution.Status?, cacheLease: PendingLocalSaveStore.CacheReadLease?, readProof: PendingLocalSaveStore.ReadKeyPublication?) {
@@ -5376,32 +5378,8 @@ final class DatabaseViewModel {
             isCloudRefreshPending = resolution.status == .refreshSkipped
             hasPendingCloudUploads = pendingUploadMarkerCheck(resolution.reference)
             unlockStatusMessage = Self.decryptingStatusMessage
-            let readReference = await Task.detached { () -> DatabaseReference in
-                guard resolution.pendingUploadSources.isEmpty,
-                      let observed = observedReference.cloudSyncMetadata,
-                      let learned = resolution.reference.cloudSyncMetadata else { return observedReference }
-                let update = DatabaseListStore.compareAndUpdateCloudSyncMetadata(for: observedReference.id, ifUnchangedFrom: observed) {
-                    $0.remoteContentHash = learned.remoteContentHash
-                    $0.remoteModifiedAt = learned.remoteModifiedAt
-                    $0.remoteRev = learned.remoteRev
-                    $0.lastSyncedAt = learned.lastSyncedAt
-                    $0.lastSyncIssue = learned.lastSyncIssue
-                }
-                switch update {
-                case .published:
-                    var reference = observedReference
-                    reference.updateCloudSyncMetadata {
-                        $0.remoteContentHash = learned.remoteContentHash
-                        $0.remoteModifiedAt = learned.remoteModifiedAt
-                        $0.remoteRev = learned.remoteRev
-                        $0.lastSyncedAt = learned.lastSyncedAt
-                        $0.lastSyncIssue = learned.lastSyncIssue
-                    }
-                    return reference
-                case .mismatch, .removed, .writeFailed:
-                    // Bytes already read cannot borrow a newer reference's authority after a rejected CAS.
-                    return observedReference
-                }
+            let readReference = await Task.detached {
+                Self.publishCloudReadMetadata(resolution, observed: observedReference) ?? observedReference
             }.value
             guard observedCycle == lockCycleID, databaseReference == observedReference else { throw CancellationError() }
             databaseReference = readReference
