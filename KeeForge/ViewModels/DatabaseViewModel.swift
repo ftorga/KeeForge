@@ -4211,11 +4211,6 @@ final class DatabaseViewModel {
         }
         isCloudRefreshPending = false
 
-        guard FileDigest.sha512(resolution.data) != openTimeSHA512 else {
-            cloudSyncOutcome = .upToDate
-            return
-        }
-
         if !resolution.pendingUploadSources.isEmpty {
             guard CloudJournalDecision.permitsMutation(resolution.pendingUploadSources.map(\.marker), changingKey: false) else {
                 cloudSyncOutcome = .failed(CloudSaveRecoveryWarning().localizedDescription)
@@ -4223,6 +4218,11 @@ final class DatabaseViewModel {
             }
             saveConflict = SaveConflict(remoteSHA512: FileDigest.sha512(resolution.data), remoteData: resolution.data)
             cloudSyncOutcome = .updateWaitsForSave
+            return
+        }
+
+        guard FileDigest.sha512(resolution.data) != openTimeSHA512 else {
+            cloudSyncOutcome = .upToDate
             return
         }
 
