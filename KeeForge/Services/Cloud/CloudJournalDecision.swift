@@ -35,6 +35,62 @@ enum CloudJournalDecision {
         }
     }
 
+    enum Delivery: Equatable { case reconcile, retain, conflict, dispatch }
+    struct DeliverySnapshot {
+        let marker: PendingUploadQueue.Marker
+        let siblings: [PendingUploadQueue.Marker]
+        let siblingIDs: Set<UUID>
+        let epoch: UUID?
+        let lastMasterKeyChangeAt: Date?
+        let payloadMatches: Bool
+    }
+
+    static func delivery(_ snapshot: DeliverySnapshot) -> Delivery {
+        let marker = snapshot.marker
+        if state(of: marker) == .confirmed { return .reconcile }
+        if snapshot.siblings.contains(where: {
+            $0.keyChange != nil || ($0.uploadAttemptID != nil && $0.confirmedAt == nil && $0.attemptIsFenced != true)
+        }) { return .retain }
+        if marker.uploadAttemptID == nil, marker.keyChange == nil,
+           snapshot.siblings.contains(where: { $0.isConflicted }) { return .retain }
+        if marker.requiresLocalRecovery == true { return .conflict }
+        if let predecessor = marker.predecessorOperationID, snapshot.siblingIDs.contains(predecessor) { return .retain }
+        guard marker.isPayloadFinalized == true || marker.keyChange != nil else {
+            return marker.isPayloadFinalized == nil ? .conflict : .retain
+        }
+        guard snapshot.payloadMatches else { return .conflict }
+        if marker.keyChange == nil,
+           marker.keyEpoch != snapshot.epoch || (marker.keyEpoch == nil && snapshot.lastMasterKeyChangeAt.map { marker.createdAt < $0 } == true) {
+            return .conflict
+        }
+        return transition(from: state(of: marker), on: .dispatch) == nil ? .retain : .dispatch
+    }
+
+    enum Completion: Equatable { case publishKeyEpoch, reconfirmKeyEpoch, restoreHead, restoreDescendant, reject }
+    struct CompletionSnapshot {
+        let marker: PendingUploadQueue.Marker
+        let operationID: UUID
+        let head: UUID?
+        let epoch: UUID?
+        let lastMasterKeyChangeAt: Date?
+        let hasVerifiedDescendant: Bool
+    }
+
+    static func completion(_ snapshot: CompletionSnapshot) -> Completion {
+        let marker = snapshot.marker
+        guard state(of: marker) == .confirmed else { return .reject }
+        if let change = marker.keyChange {
+            if snapshot.epoch == change.epoch {
+                return snapshot.head == snapshot.operationID ? .reconfirmKeyEpoch : .reject
+            }
+            return snapshot.lastMasterKeyChangeAt.map { $0 > marker.createdAt } == true ? .reject : .publishKeyEpoch
+        }
+        guard marker.keyEpoch == snapshot.epoch,
+              !(marker.keyEpoch == nil && snapshot.lastMasterKeyChangeAt.map { marker.createdAt < $0 } == true) else { return .reject }
+        if snapshot.head == snapshot.operationID { return .restoreHead }
+        return snapshot.hasVerifiedDescendant ? .restoreDescendant : .reject
+    }
+
     static func permitsMutation(_ markers: [PendingUploadQueue.Marker], changingKey: Bool) -> Bool {
         guard !markers.contains(where: {
             [.invalid, .prepared, .attempting, .recoveryRequired].contains(state(of: $0)) || $0.keyChange != nil
@@ -44,11 +100,12 @@ enum CloudJournalDecision {
     }
 
     static func trustedBaseUnchanged(
-        marker: PendingUploadQueue.Marker, recorded: CloudSyncMetadata, remote: CloudFileMetadata
+        marker: PendingUploadQueue.Marker, recorded: CloudSyncMetadata, remote: CloudFileMetadata,
+        revisionIsContentIdentity: Bool
     ) -> Bool {
         guard state(of: marker) == .ready, marker.uploadAttemptID == nil || marker.attemptIsFenced == true,
               marker.remoteBaseSHA512 != nil else { return false }
-        if let expected = marker.expectedRev, let rev = remote.rev { return expected == rev }
+        if revisionIsContentIdentity, let expected = marker.expectedRev, let rev = remote.rev { return expected == rev }
         if let hash = recorded.remoteContentHash, let observed = remote.contentHash { return hash == observed }
         return false
     }

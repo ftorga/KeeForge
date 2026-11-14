@@ -181,6 +181,8 @@ final class FTPCloudProvider: CloudProvider, FTPConnecting, Sendable {
     /// conditional write: `expectedRev` is checked against a fresh download
     /// after the transfer, immediately before the move, which is as close to
     /// the write as the protocol allows.
+    func revisionIdentifiesContent(_ revision: String?) -> Bool { revision?.hasPrefix("sha256:") == true }
+
     func writeGuarantee(expectedRev: String?, byteCount: Int) -> CloudWriteGuarantee {
         .preflightOnly
     }

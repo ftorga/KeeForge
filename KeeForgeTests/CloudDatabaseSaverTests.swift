@@ -1416,6 +1416,109 @@ final class CloudDatabaseSaverTests: XCTestCase {
         XCTAssertEqual(PendingUploadQueue.listMarkers(for: reference.id).count, 1)
     }
 
+    func testDeliverySkipsDownloadOnlyForContentIdentifyingRevisionOrDigest() async throws {
+        for kind in ["strong", "weak", "lastmod", "missing", "mismatch", "ftp-digest"] {
+            DatabaseListStore.clearAll()
+            let revision: String? = switch kind {
+            case "strong": "\"strong-tag\""
+            case "weak": "W/\"weak-tag\""
+            case "lastmod": "lastmod:unchanged-second"
+            case "ftp-digest": "sha256:exact-content-digest"
+            default: nil
+            }
+            let reference = try makeCloudReference(remoteRev: revision)
+            let cache = DatabaseListStore.cacheLocation(for: reference)
+            let context = try makeDirtySaveContext(cacheURL: cache, entryTitle: "Delivery \(kind)")
+            let uploads = UploadRecorder()
+            let downloads = UploadRecorder()
+            let remote = kind == "weak" || kind == "lastmod" || kind == "mismatch" ? Data("different remote bytes".utf8) : context.currentData
+            var environment = makeEnvironment(getMetadata: { _ in
+                CloudFileMetadata(modifiedDate: .now, contentHash: nil, size: Int64(remote.count), rev: revision)
+            }, upload: { _, bytes, rev, _ in
+                await uploads.record(data: bytes, expectedRev: rev)
+                return CloudFileMetadata(modifiedDate: .now, contentHash: nil, size: Int64(bytes.count), rev: "delivered")
+            }, downloadRemoteData: { _ in
+                await downloads.record(data: remote, expectedRev: revision)
+                return remote
+            })
+            environment.revisionIdentifiesContent = { _, rev in
+                kind == "ftp-digest" ? FTPCloudProvider.shared.revisionIdentifiesContent(rev)
+                    : WebDAVCloudProvider.shared.revisionIdentifiesContent(rev)
+            }
+            let result = try await CloudDatabaseSaver.save(draft: context.draft, reference: reference,
+                compositeKey: context.compositeKey, openTimeSHA512: context.openTimeSHA512,
+                expectedRev: revision, kdfPolicy: .mainApp, environment: environment)
+            guard case .saved = result else { return XCTFail("Local publication must precede delivery") }
+            let marker = try XCTUnwrap(PendingUploadQueue.readJournal(for: reference.id).first)
+            let delivered = try await CloudDatabaseSaver.deliver(marker, reference: reference, environment: environment)
+            let downloadCount = await downloads.callCount()
+            let uploadCount = await uploads.callCount()
+            XCTAssertEqual(downloadCount, kind == "strong" || kind == "ftp-digest" ? 0 : 1, kind)
+            if kind == "weak" || kind == "lastmod" || kind == "mismatch" {
+                guard case .conflict? = delivered else { return XCTFail("Unchanged weak metadata cannot authorize overwriting different bytes") }
+                XCTAssertEqual(uploadCount, 0, kind)
+                XCTAssertEqual(try PendingUploadQueue.readImmutablePayload(marker), try Data(contentsOf: cache))
+            } else {
+                guard case .saved? = delivered else { return XCTFail("Verified byte base permits one delivery") }
+                XCTAssertEqual(uploadCount, 1, kind)
+            }
+        }
+    }
+
+    func testJournalTransitionTableRejectsEveryUnlistedEffect() {
+        let states: [CloudJournalDecision.State] = [.legacy, .prepared, .ready, .attempting, .confirmed, .recoveryRequired, .invalid]
+        let events: [CloudJournalDecision.Event] = [.payloadInstalled, .dispatch, .acknowledged, .rejectedBeforeCommit, .localReconciled, .interruption]
+        for state in states {
+            for event in events {
+                let expected: CloudJournalDecision.Transition?
+                switch (state, event) {
+                case (.prepared, .payloadInstalled): expected = .init(state: .ready, effects: [.persist, .publishReference])
+                case (.ready, .dispatch): expected = .init(state: .attempting, effects: [.persist, .upload])
+                case (.ready, .acknowledged), (.attempting, .acknowledged): expected = .init(state: .confirmed, effects: [.persist, .publishReference])
+                case (.attempting, .rejectedBeforeCommit): expected = .init(state: .ready, effects: [.persist])
+                case (.confirmed, .localReconciled): expected = .init(state: .confirmed, effects: [.retire])
+                case (.attempting, .interruption): expected = .init(state: .attempting, effects: [.retainForRecovery])
+                default: expected = nil
+                }
+                XCTAssertEqual(CloudJournalDecision.transition(from: state, on: event), expected)
+            }
+        }
+    }
+
+    func testConfirmedDeliveryFlushFailureRetainsAndReconcilesWithoutResending() async throws {
+        let reference = try makeCloudReference(remoteRev: "rev-A")
+        let cache = DatabaseListStore.cacheLocation(for: reference)
+        let context = try makeDirtySaveContext(cacheURL: cache, entryTitle: "Confirmed retained")
+        let uploads = UploadRecorder()
+        var environment = makeEnvironment(getMetadata: { _ in
+            CloudFileMetadata(modifiedDate: .now, contentHash: nil, size: 0, rev: "rev-A")
+        }, upload: { _, bytes, rev, _ in
+            await uploads.record(data: bytes, expectedRev: rev)
+            return CloudFileMetadata(modifiedDate: .now, contentHash: nil, size: Int64(bytes.count), rev: "rev-B")
+        })
+        _ = try await CloudDatabaseSaver.save(draft: context.draft, reference: reference,
+            compositeKey: context.compositeKey, openTimeSHA512: context.openTimeSHA512,
+            expectedRev: "rev-A", kdfPolicy: .mainApp, environment: environment)
+        let marker = try XCTUnwrap(PendingUploadQueue.readJournal(for: reference.id).first)
+        let installed = try Data(contentsOf: cache)
+        let flush = environment.synchronizeCacheFile
+        environment.synchronizeCacheFile = { _ in throw CocoaError(.fileWriteNoPermission) }
+        guard case .retained? = try await CloudDatabaseSaver.deliver(marker, reference: reference, environment: environment) else {
+            return XCTFail("Observed confirmation cannot retire before cache durability")
+        }
+        let confirmed = try XCTUnwrap(PendingUploadQueue.readJournal(for: reference.id).first)
+        XCTAssertNotNil(confirmed.marker.confirmedAt)
+        XCTAssertEqual(try PendingUploadQueue.readImmutablePayload(confirmed), installed)
+        environment.synchronizeCacheFile = flush
+        guard case .saved? = try await CloudDatabaseSaver.deliver(confirmed, reference: reference, environment: environment) else {
+            return XCTFail("Explicit reconciliation of a confirmed receipt must complete without another upload")
+        }
+        let calls = await uploads.callCount()
+        XCTAssertEqual(calls, 1)
+        XCTAssertTrue(try PendingUploadQueue.readJournal(for: reference.id).isEmpty)
+        XCTAssertEqual(try Data(contentsOf: cache), installed)
+    }
+
     func testJournalDecisionRejectsUncertaintyAndUnknownVersions() async throws {
         let reference = try makeCloudReference(remoteRev: "rev-A")
         let bytes = try Data(contentsOf: DatabaseListStore.cacheLocation(for: reference))
@@ -1503,6 +1606,7 @@ final class CloudDatabaseSaverTests: XCTestCase {
         environment.getMetadata = getMetadata
         environment.upload = upload
         environment.downloadRemoteData = downloadRemoteData
+        environment.revisionIdentifiesContent = { _, revision in revision?.isEmpty == false }
         environment.now = now
         return environment
     }

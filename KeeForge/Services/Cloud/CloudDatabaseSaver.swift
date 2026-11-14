@@ -36,6 +36,11 @@ enum CloudDatabaseSaver {
         var pruneBackups: @Sendable (DatabaseReference, Int) throws -> Void
         var now: @Sendable () -> Date
         var queue: PendingUploadQueue.Environment = .live
+        var revisionIdentifiesContent: @Sendable (DatabaseReference, String?) -> Bool = { reference, revision in
+            guard let metadata = reference.cloudSyncMetadata,
+                  let provider = CloudProviderRegistry.provider(for: metadata.provider) else { return false }
+            return provider.revisionIdentifiesContent(revision)
+        }
         var writeGuarantee: @Sendable (DatabaseReference, String?, Int) -> CloudWriteGuarantee = { reference, rev, count in
             guard let metadata = reference.cloudSyncMetadata,
                   let provider = CloudProviderRegistry.provider(for: metadata.provider) else { return .preflightOnly }
@@ -369,43 +374,27 @@ enum CloudDatabaseSaver {
             return try recoverConfirmed(stored, reference: reference, environment: environment)
         }
         let marker = stored.marker
-        let all = PendingUploadQueue.listMarkers(for: reference.id, environment: environment.queue)
-        if all.contains(where: { $0.id != stored.id && ($0.marker.keyChange != nil || ($0.marker.uploadAttemptID != nil && $0.marker.confirmedAt == nil && $0.marker.attemptIsFenced != true)) }) { return nil }
-        if marker.uploadAttemptID == nil, marker.keyChange == nil,
-           all.contains(where: { $0.id != stored.id && $0.marker.isConflicted }) { return nil }
-        if marker.requiresLocalRecovery == true { return .conflict(remoteRev: nil) }
-        if let predecessorID = marker.predecessorOperationID,
-           all.contains(where: { $0.id == predecessorID }) { return nil }
-        guard marker.isPayloadFinalized == true || marker.keyChange != nil else {
-            if marker.isPayloadFinalized == nil {
-                try PendingUploadQueue.markDatabaseConflicted(for: reference.id, environment: environment.queue)
-                return .conflict(remoteRev: nil)
-            }
-            return nil
-        }
+        let all = try PendingUploadQueue.readJournal(for: reference.id, environment: environment.queue)
         let bytes = try marker.intendedPayloadPath == nil
             ? environment.readData(environment.cacheURL(reference))
             : PendingUploadQueue.readImmutablePayload(stored, environment: environment.queue)
         let payloadSHA = marker.intendedPayloadSHA512 ?? marker.openTimeSHA512
-        guard FileDigest.sha512(bytes) == payloadSHA else {
+        let siblings = all.filter { $0.id != stored.id }
+        let decision = CloudJournalDecision.delivery(.init(marker: marker, siblings: siblings.map(\.marker),
+            siblingIDs: Set(siblings.map(\.id)), epoch: reference.cloudSyncMetadata?.keyEpoch, lastMasterKeyChangeAt: reference.lastMasterKeyChangeAt,
+            payloadMatches: FileDigest.sha512(bytes) == payloadSHA))
+        switch decision {
+        case .reconcile: return try recoverConfirmed(stored, reference: reference, environment: environment)
+        case .retain: return .retained(updatedReference: reference)
+        case .conflict:
             try PendingUploadQueue.markDatabaseConflicted(for: reference.id, environment: environment.queue)
             return .conflict(remoteRev: nil)
-        }
-        if marker.keyChange == nil {
-            let wrongEpoch = marker.keyEpoch != reference.cloudSyncMetadata?.keyEpoch
-            let predatesRekey = reference.lastMasterKeyChangeAt.map { marker.createdAt < $0 } ?? false
-            if wrongEpoch || (marker.keyEpoch == nil && predatesRekey) {
-                try PendingUploadQueue.markDatabaseConflicted(for: reference.id, environment: environment.queue)
-                return .conflict(remoteRev: nil)
-            }
-        }
-        guard CloudJournalDecision.transition(from: CloudJournalDecision.state(of: stored.marker), on: .dispatch) != nil else {
-            // Neither changed metadata nor identical remote bytes settle a dispatched request.
-            return .retained(updatedReference: reference)
+        case .dispatch: break
         }
         let remoteMetadata = try await environment.getMetadata(reference)
         let baseUnchanged = reference.cloudSyncMetadata.map {
-            CloudJournalDecision.trustedBaseUnchanged(marker: stored.marker, recorded: $0, remote: remoteMetadata)
+            CloudJournalDecision.trustedBaseUnchanged(marker: stored.marker, recorded: $0, remote: remoteMetadata,
+                revisionIsContentIdentity: environment.revisionIdentifiesContent(reference, remoteMetadata.rev))
         } ?? false
         if !baseUnchanged {
             let remoteBytes = try await environment.downloadRemoteData(reference)
@@ -421,28 +410,49 @@ enum CloudDatabaseSaver {
         }
         try Task.checkCancellation()
         try PendingUploadQueue.assertCreationAllowsMutation(reference, environment: environment.queue)
-        stored.marker.expectedRev = expectedRev
-        stored.marker.uploadAttemptID = UUID()
-        stored.marker.attemptIsFenced = false
-        stored = try PendingUploadQueue.update(stored, environment: environment.queue)
-        let response: CloudFileMetadata
-        do { response = try await environment.upload(reference, bytes, expectedRev, { _ in }) }
+        guard let dispatch = CloudJournalDecision.transition(from: CloudJournalDecision.state(of: stored.marker), on: .dispatch) else {
+            return .retained(updatedReference: reference)
+        }
+        var response: CloudFileMetadata?
+        do {
+            for effect in dispatch.effects {
+                switch effect {
+                case .persist:
+                    stored.marker.expectedRev = expectedRev
+                    stored.marker.uploadAttemptID = UUID()
+                    stored.marker.attemptIsFenced = false
+                    stored = try PendingUploadQueue.update(stored, environment: environment.queue)
+                case .upload: response = try await environment.upload(reference, bytes, expectedRev, { _ in })
+                default: throw SaveError.saveContextUnavailable
+                }
+            }
+        }
         catch {
             if let failure = error as? CloudUploadFailure, failure.provesNoCommit,
-               CloudJournalDecision.transition(from: .attempting, on: .rejectedBeforeCommit) != nil {
-                stored.marker.attemptIsFenced = true
-                _ = try PendingUploadQueue.update(stored, environment: environment.queue)
+               let rejected = CloudJournalDecision.transition(from: .attempting, on: .rejectedBeforeCommit) {
+                for effect in rejected.effects {
+                    guard effect == .persist else { throw SaveError.saveContextUnavailable }
+                    stored.marker.attemptIsFenced = true
+                    stored = try PendingUploadQueue.update(stored, environment: environment.queue)
+                }
             }
             throw error
         }
-        guard CloudJournalDecision.transition(from: .attempting, on: .acknowledged) != nil else {
+        guard let response, let acknowledged = CloudJournalDecision.transition(from: .attempting, on: .acknowledged) else {
             throw SaveError.saveContextUnavailable
         }
-        stored.marker.confirmedRemoteRev = response.rev
-        stored.marker.confirmedRemoteHash = response.contentHash
-        stored.marker.confirmedAt = .now
-        stored = try PendingUploadQueue.update(stored, environment: environment.queue)
-        return try finishDelivery(stored, reference: reference, bytes: bytes, environment: environment)
+        for effect in acknowledged.effects {
+            switch effect {
+            case .persist:
+                stored.marker.confirmedRemoteRev = response.rev
+                stored.marker.confirmedRemoteHash = response.contentHash
+                stored.marker.confirmedAt = .now
+                stored = try PendingUploadQueue.update(stored, environment: environment.queue)
+            case .publishReference: return try finishDelivery(stored, reference: reference, bytes: bytes, environment: environment)
+            default: throw SaveError.saveContextUnavailable
+            }
+        }
+        throw SaveError.saveContextUnavailable
     }
 
     /// Completes only local reconciliation of an already-confirmed journal; never contacts a provider.
@@ -526,16 +536,18 @@ enum CloudDatabaseSaver {
                 guard var current = DatabaseListStore.databases.first(where: { $0.id == reference.id }) else {
                     throw SaveError.saveContextUnavailable
                 }
+                let descendant = stored.marker.keyChange == nil
+                    ? try PendingUploadQueue.localDescendantOwner(of: stored, reference: current, environment: environment.queue) : nil
+                let completion = CloudJournalDecision.completion(.init(marker: stored.marker, operationID: stored.id,
+                    head: current.cloudSyncMetadata?.localHeadOperationID, epoch: current.cloudSyncMetadata?.keyEpoch,
+                    lastMasterKeyChangeAt: current.lastMasterKeyChangeAt, hasVerifiedDescendant: descendant != nil))
+                guard completion != .reject else { throw SaveError.saveContextUnavailable }
                 if let rekey = stored.marker.keyChange {
                     guard PendingUploadQueue.listMarkers(for: current.id, environment: environment.queue).contains(where: {
                         $0.id == stored.id && $0.marker == stored.marker
                     }) else { throw SaveError.rekeyAppliedRemotely }
-                    let publishingEpoch = current.cloudSyncMetadata?.keyEpoch != rekey.epoch
-                    if publishingEpoch {
-                        guard current.lastMasterKeyChangeAt.map({ $0 > stored.marker.createdAt }) != true else {
-                            throw SaveError.rekeyAppliedRemotely
-                        }
-                    } else {
+                    let publishingEpoch = completion == .publishKeyEpoch
+                    if !publishingEpoch {
                         guard let observed = current.cloudSyncMetadata,
                               observed.localHeadOperationID == stored.id,
                               case .published(let durable) = DatabaseListStore.compareAndUpdateCloudSyncMetadata(
@@ -564,16 +576,9 @@ enum CloudDatabaseSaver {
                 if stored.marker.keyChange != nil {
                     owner = stored
                 } else {
-                    guard stored.marker.keyEpoch == current.cloudSyncMetadata?.keyEpoch,
-                          !(stored.marker.keyEpoch == nil && current.lastMasterKeyChangeAt.map({ stored.marker.createdAt < $0 }) == true) else {
-                        throw SaveError.saveContextUnavailable
-                    }
-                    if current.cloudSyncMetadata?.localHeadOperationID == stored.id {
-                        owner = stored
-                    } else {
-                        guard let descendant = PendingUploadQueue.localDescendantOwner(of: stored, reference: current, environment: environment.queue) else {
-                            throw SaveError.saveContextUnavailable
-                        }
+                    if completion == .restoreHead { owner = stored }
+                    else {
+                        guard completion == .restoreDescendant, let descendant else { throw SaveError.saveContextUnavailable }
                         owner = descendant
                     }
                     let ownerBytes = try journalPayload(owner, environment: environment)
@@ -620,9 +625,15 @@ enum CloudDatabaseSaver {
                 guard verifiedCacheReference(owner: owner, referenceID: current.id, environment: environment) != nil else {
                     throw SaveError.saveContextUnavailable
                 }
-                if try !PendingUploadQueue.dropIfUnchanged(stored, environment: environment.queue),
-                   PendingUploadQueue.listMarkers(for: current.id, environment: environment.queue).contains(where: { $0.id == stored.id }) {
-                    return .retained(updatedReference: current)
+                guard let reconciled = CloudJournalDecision.transition(from: CloudJournalDecision.state(of: stored.marker), on: .localReconciled) else {
+                    throw SaveError.saveContextUnavailable
+                }
+                for effect in reconciled.effects {
+                    guard effect == .retire else { throw SaveError.saveContextUnavailable }
+                    if try !PendingUploadQueue.dropIfUnchanged(stored, environment: environment.queue),
+                       PendingUploadQueue.listMarkers(for: current.id, environment: environment.queue).contains(where: { $0.id == stored.id }) {
+                        return .retained(updatedReference: current)
+                    }
                 }
                 return .saved(updatedReference: current)
             }

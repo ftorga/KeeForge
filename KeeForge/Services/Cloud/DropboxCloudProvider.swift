@@ -224,6 +224,8 @@ final class DropboxCloudProvider: CloudProvider, @unchecked Sendable {
         }
     }
 
+    func revisionIdentifiesContent(_ revision: String?) -> Bool { revision?.isEmpty == false }
+
     func writeGuarantee(expectedRev: String?, byteCount: Int) -> CloudWriteGuarantee {
         expectedRev?.isEmpty == false ? .serverConditional : .preflightOnly
     }

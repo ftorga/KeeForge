@@ -54,6 +54,7 @@ protocol CloudProvider: AnyObject, Sendable {
     /// `CloudSyncCoordinator.openProbeDeadline`.
     var metadataProbeTransfersContent: Bool { get }
     func writeGuarantee(expectedRev: String?, byteCount: Int) -> CloudWriteGuarantee
+    func revisionIdentifiesContent(_ revision: String?) -> Bool
     func upload(
         accountId: String,
         fileId: String,
@@ -70,6 +71,8 @@ protocol CloudProvider: AnyObject, Sendable {
 }
 
 extension CloudProvider {
+    func revisionIdentifiesContent(_ revision: String?) -> Bool { false }
+
     func writeGuarantee(expectedRev: String?, byteCount: Int) -> CloudWriteGuarantee { .preflightOnly }
 
     @MainActor
