@@ -519,7 +519,7 @@ final class DropboxCloudProvider: CloudProvider, @unchecked Sendable {
         if let clientForAccount { return try clientForAccount(accountId) }
         // `withLockUnchecked` because the SDK's client and OAuth manager are not
         // `Sendable`; the lock is what keeps them single-threaded here.
-        try state.withLockUnchecked { state in
+        return try state.withLockUnchecked { state in
             try Self.configure(&state)
 
             if let cached = state.clients[accountId] {
