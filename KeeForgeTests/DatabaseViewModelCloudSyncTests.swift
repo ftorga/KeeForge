@@ -798,7 +798,6 @@ final class DatabaseViewModelCloudSyncTests: XCTestCase {
                         providerResolver: { _ in remote })
                 }, localPublicationFailure: { diagnostics.record($0, $1) },
             cloudSaveOperation: { draft, reference, key, sha, remoteSHA, rev, newKey, settings in
-                    phase = "saver-or-rekey.before"
                     diagnostics.recordObservation("saver.enter")
                 return try await CloudDatabaseSaver.save(draft: draft, reference: reference, compositeKey: key,
                         openTimeSHA512: sha, reconciledRemoteSHA512: remoteSHA, expectedRev: rev, kdfPolicy: .mainApp,
