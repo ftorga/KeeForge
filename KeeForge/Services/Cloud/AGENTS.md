@@ -6,8 +6,8 @@
 
 - `CloudProvider` is the only boundary the rest of the app talks to; SDK and protocol behavior stays behind it. The WebDAV and FTP protocol clients are the `RemoteFileTransports` package (`../../../Packages/RemoteFileTransports/AGENTS.md`); the two providers own credentials, account ids, conflict handling, and every message. `WebDAVError+CloudProvider.swift` holds the WebDAV messages and must keep `.networkUnavailable` and `.serviceUnavailable` for the failures `isLikelyOffline` treats as offline. `CloudProviderRegistry.provider(for:)` resolves one, including the UI-test doubles.
 - `CloudSyncModels`: the persisted shapes. Concurrency uses one opaque `rev`; each provider maps its own validator onto it (Dropbox rev, OneDrive cTag/eTag, WebDAV ETag, FTP `sha256:` of the bytes).
-- `CloudDatabaseSaver.remoteHasDiverged`: the single conflict gate for both the app save and a pending-upload push.
-- `CloudSyncCoordinator`: when an open contacts the provider, and every replacement of a cloud cache file (`downloadLatestCopy`, `applyUploadedBytesAfterSave`).
+- Pure journal decisions gate delivery and confirmed reconciliation; the saver executes their declared effects against actual storage and provider observations.
+- `CloudSyncCoordinator`: when an open contacts the provider, and every replacement of a cloud cache file (`downloadLatestCopy` and confirmed journal recovery).
 - `PendingUploadQueue` (compiled into the extensions): marker storage. `PendingUploadDrainer` (app only): the only uploader of markers. Draining goes through `DatabaseListViewModel.drainPendingUploadsOnAppActive()`; the second instance `KeeForgeApp` holds only observes the AutoFill notification. `PendingUploadRecovery`: finds a conflicted marker's bytes for a merge.
 
 ## Invariants
@@ -28,7 +28,7 @@
 
 ### Conflict verification
 
-- A missing `expectedRev` must never skip `remoteHasDiverged`. The upload then goes out unconditionally (Dropbox overwrite, OneDrive replace), so the metadata check is the only protection: it compares content hashes, and if the remote reports no hash any remote rev counts as divergence. Only a provider exposing neither is unverified.
+- Missing or weak revision evidence requires a downloaded SHA match against the recorded remote base before dispatch. An uncertain attempt never gains resend permission from metadata or byte equality.
 - The app save rebases instead of conflicting only when the remote bytes hash to a state `SaveBaseline` covers, at the divergence gate and after a provider 412, with exactly one retry. The retry's rev is read before the byte check so an edit in between fails `If-Match`. Bytes that differ always conflict.
 - The pending-upload push uses the plain gate; it has no baseline.
 - The backup is written before the upload, so a local failure cannot leave the remote advanced and the save reported as failed.
@@ -40,7 +40,7 @@
 - The metadata probe races `openProbeDeadline` only when a cache can stand in; a miss is treated as offline. With no cache it waits out the transport.
 - `downloadLatestCopy` pins the existing cache with a hard link before the transfer and before listing markers, then publishes with a coordinated replace conditioned on the pinned inode. A save that lands mid-download then makes the sync fall back to the cache instead of reverting it.
 - Do not move the pin after the download (it would pin the newer save and replace it), and do not use a rename-aside (the cache path would be empty during the transfer).
-- When a marker is queued, both cache-replacing paths back the cache up into the database's backup directory first (`applyUploadedBytesAfterSave` only when the cache differs from the bytes being applied). A failed backup aborts the replacement: losing the only copy of an unuploaded save is worse than a failed refresh.
+- Cache replacement backs up the superseded bytes before overwrite when pending work needs protection. Confirmed journal recovery only restores a verified predecessor or missing cache; unrelated divergent bytes remain untouched. A failed backup aborts replacement.
 - Cloud state learned across an `await` is written with `DatabaseListStore.updateCloudSyncMetadata(for:ifUnchangedFrom:mutate:)`, not `update(_:)`, which would roll back a save or drain that finished inside the window.
 
 ### Durable cloud journal
@@ -49,7 +49,7 @@
 - `CloudJournalDecision` is the extension-safe pure admission/transition policy, including delivery eligibility and confirmed head/epoch/descendant reconciliation. Adapters supply storage observations and execute declared dispatch/acknowledgement/retirement effects. Adapters own filesystem/provider effects. Dispatch requires a durable attempt UUID; only an actual response confirms delivery. Generic errors, remote equality, changed revisions and missing files never settle an uncertain attempt or authorize retransmission.
 - Marker generations are CAS protected. Confirmed delivery verifies the exact cache/head/epoch, reconfirms cache and registry durability, transfers predecessor ancestry and durably removes the marker before deleting its payload. Failure retains recovery evidence; confirmed reconciliation never uploads again.
 - Cache reads and credential filling remain available when recovery fails. Mutations use strict journal reads; unknown formats and unreadable owners fail closed. A pending journal prevents sync-down from overwriting the shared copy.
-- Cloud cache/key publication validates captured reference epoch/date and current ciphertext under cache coordination, immediate try-list, immediate try-commit and local revocation ownership. No provider calls or awaits occur under those locks. Keychain callbacks are keychain-only; legacy reference cleanup runs after release. These synchronous cache checks are a draft performance limitation, not a provider deadline guarantee.
+- Cloud cache/key publication validates captured reference epoch/date and current ciphertext under cache coordination, immediate try-list, immediate try-commit and local revocation ownership. No provider calls or awaits occur under those locks. Keychain callbacks are keychain-only; legacy reference cleanup runs after release. App and AutoFill run coordination, full cache hashing and keychain-only publication off the main actor through the shared bounded worker and per-action permit. Cancellation/timeout closes an unclaimed permit; a claimed effect retains authority until completion and cannot be described as no-effect.
 - Stable commit leases live outside the payload directory. Owner code never waits for a list lock while another path holds it and waits for the lease: reverse acquisition must be immediate try and release on contention.
 - Shipped marker decoding remains supported. Legacy finalized payloads are snapshotted before overwrite; unidentified provisional markers block mutation. There are no migrations for intermediate unshipped journal schemas.
 - Creation records are separate from replacement markers. Persist ciphertext and a paused intent before a single create-only provider call. Persist attempting before dispatch and the returned identity before local registration. Restart/foreground drain never resumes creations automatically; cancellation propagates to the foreground worker, which records a received response but checks cancellation before registration.
@@ -87,3 +87,5 @@
 - `../AGENTS.md`, `../Persistence/AGENTS.md`, `../Security/AGENTS.md`
 - `../../ViewModels/AGENTS.md`: merge, rekey, Sync Now, and when markers are merged or refused
 - `../../Views/Cloud/AGENTS.md`, `../../../KeeForgeMac/SECURITY.md`, `../../../docs/threat-model.md`
+
+- SDK transport tests use a real client with a unique intercepted host. Only read operations retry; write failure retains its actual journal attempt even when a response was lost or a conflict was returned.

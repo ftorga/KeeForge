@@ -59,8 +59,7 @@ enum CloudFileCreationCoordinator {
         return try await deliver(intent, environment: environment)
     }
 
-    static func resume(operationID: UUID, unpausing: Bool = true, environment: Environment = .live) async throws -> DatabaseReference {
-        guard unpausing else { throw RecoveryRequired(operationID: operationID) }
+    static func resume(operationID: UUID, environment: Environment = .live) async throws -> DatabaseReference {
         let lease = try acquireLease(operationID, environment)
         defer { releaseLease(lease) }
         guard let intent = try PendingUploadQueue.listCreations(includingCompleted: true, environment: environment.queue).first(where: { $0.operationID == operationID }) else { throw CloudProviderError.fileNotFound }

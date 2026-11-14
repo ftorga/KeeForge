@@ -125,7 +125,7 @@ final class CloudSyncCoordinatorTests: XCTestCase {
     }
 
     /// A save can land in the cache while the download is in flight (an app
-    /// save's `applyUploadedBytesAfterSave`, an AutoFill save). Its bytes are
+    /// save's journal delivery, an AutoFill save). Its bytes are
     /// newer than the ones arriving, so the download must not replace them:
     /// the next sync would then see the save's revision, trust the cache, and
     /// hand back the pre-save bytes.
@@ -449,11 +449,7 @@ final class CloudSyncCoordinatorTests: XCTestCase {
         )
     }
 
-    func testSyncDownloadBacksUpCacheWhenPendingUploadMarkerExists() async throws {
-        // M2: the shared cache is the only home of an AutoFill save until its
-        // pending upload drains. A sync-down that replaces the cache while a
-        // marker is queued must first write a timestamped backup of the bytes
-        // being replaced.
+    func testSyncDownloadRetainsPendingCiphertextWithoutProviderIO() async throws {
         let reference = makeCloudReference(
             remoteContentHash: "old-hash",
             remoteModifiedAt: Date(timeIntervalSince1970: 100)
@@ -479,12 +475,16 @@ final class CloudSyncCoordinatorTests: XCTestCase {
             providerResolver: { _ in provider }
         )
 
-        XCTAssertEqual(resolution.status, .downloaded)
+        XCTAssertEqual(resolution.status, .refreshSkipped)
+        XCTAssertEqual(resolution.data, pendingBytes)
+        XCTAssertEqual(provider.metadataCallCount, 0)
+        XCTAssertEqual(provider.downloadCallCount, 0)
+        XCTAssertEqual(PendingUploadQueue.listMarkers(for: reference.id).count, 1)
         XCTAssertEqual(
             try Data(contentsOf: DatabaseListStore.cacheLocation(for: reference)),
-            Data("fresh-cloud-copy".utf8)
+            pendingBytes
         )
-        XCTAssertEqual(backupContents(for: reference), [pendingBytes])
+        XCTAssertTrue(backupContents(for: reference).isEmpty)
     }
 
     func testSyncDownloadWithoutPendingMarkerWritesNoBackup() async throws {
@@ -512,136 +512,133 @@ final class CloudSyncCoordinatorTests: XCTestCase {
         XCTAssertEqual(backupContents(for: reference), [])
     }
 
-    func testApplyUploadedBytesBacksUpDivergentCacheWhenPendingUploadMarkerExists() throws {
-        // M2: an AutoFill save can land in the cache while an app-side upload
-        // is in flight; the post-upload cache refresh must not silently revert
-        // it. With a marker queued and the cache differing from the uploaded
-        // bytes, a backup of the cache must be written before the overwrite.
-        let reference = makeCloudReference(remoteContentHash: nil, remoteModifiedAt: nil)
-        let autoFillBytes = Data("interleaved-autofill-bytes".utf8)
-        try DatabaseListStore.cacheDatabaseCopy(autoFillBytes, for: reference)
-        _ = try PendingUploadQueue.enqueue(
-            makeMarker(databaseId: reference.id, openTimeSHA512: FileDigest.sha512(autoFillBytes))
-        )
-
-        let uploadedBytes = Data("app-save-uploaded-bytes".utf8)
-        _ = try CloudSyncCoordinator.applyUploadedBytesAfterSave(
-            reference: reference,
-            bytes: uploadedBytes,
-            remoteMetadata: CloudFileMetadata(modifiedDate: .now, contentHash: "uploaded", size: 64)
-        )
-
-        XCTAssertEqual(
-            try Data(contentsOf: DatabaseListStore.cacheLocation(for: reference)),
-            uploadedBytes
-        )
-        XCTAssertEqual(backupContents(for: reference), [autoFillBytes])
+    func testConfirmedDeliveryRetainsDivergentCacheAndExportableIntendedPayload() async throws {
+        let context = try makeDeliveryContext()
+        let divergent = Data("interleaved-autofill-ciphertext".utf8)
+        let transport = CloudJournalTransport(beforeUpload: {
+            try divergent.write(to: context.cacheURL, options: .atomic)
+        })
+        let environment = context.environment(transport: transport)
+        do {
+            _ = try await CloudDatabaseSaver.deliver(context.stored, reference: context.reference, environment: environment)
+            XCTFail("A response does not authorize replacing unrelated cache bytes")
+        } catch { XCTAssertEqual(error as? SaveError, .saveContextUnavailable) }
+        let retained = try XCTUnwrap(PendingUploadQueue.readJournal(for: context.reference.id).first)
+        XCTAssertNotNil(retained.marker.confirmedAt)
+        XCTAssertEqual(retained.id, context.stored.id)
+        XCTAssertEqual(try Data(contentsOf: context.cacheURL), divergent)
+        XCTAssertEqual(try PendingUploadQueue.readImmutablePayload(retained), context.payload)
+        XCTAssertEqual(backupContents(for: context.reference), [])
+        do { _ = try await CloudDatabaseSaver.deliver(retained, reference: context.reference, environment: environment) }
+        catch { XCTAssertEqual(error as? SaveError, .saveContextUnavailable) }
+        XCTAssertEqual(transport.effects.uploads, [.init(bytes: context.payload, revision: "rev-1")])
+        XCTAssertEqual(try Data(contentsOf: context.cacheURL), divergent)
+        XCTAssertEqual(try PendingUploadQueue.readImmutablePayload(retained), context.payload)
     }
 
-    func testApplyUploadedBytesSkipsBackupWhenCacheAlreadyHoldsUploadedBytes() throws {
-        // The drain path lands here with its own marker still queued (it is
-        // dropped by the drainer afterwards) and the cache already holding the
-        // pushed bytes — nothing can be lost, so no backup noise.
-        let reference = makeCloudReference(remoteContentHash: nil, remoteModifiedAt: nil)
-        let uploadedBytes = Data("drained-bytes".utf8)
-        try DatabaseListStore.cacheDatabaseCopy(uploadedBytes, for: reference)
-        _ = try PendingUploadQueue.enqueue(
-            makeMarker(databaseId: reference.id, openTimeSHA512: FileDigest.sha512(uploadedBytes))
-        )
-
-        _ = try CloudSyncCoordinator.applyUploadedBytesAfterSave(
-            reference: reference,
-            bytes: uploadedBytes,
-            remoteMetadata: CloudFileMetadata(modifiedDate: .now, contentHash: "uploaded", size: 64)
-        )
-
-        XCTAssertEqual(backupContents(for: reference), [])
-    }
-
-    func testApplyUploadedBytesKeepsRecordedRevAndHashWhenResponseOmitsThem() throws {
-        // An upload response can omit rev/hash (OneDrive session completions).
-        // Overwriting the recorded values with nil would push every later save
-        // into the nil-rev conflict fallback — the recorded values must win.
-        var reference = makeCloudReference(remoteContentHash: "hash-A", remoteModifiedAt: nil)
-        reference.updateCloudSyncMetadata { metadata in
-            metadata.remoteRev = "rev-A"
+    func testConfirmedRecoveryBacksUpVerifiedPredecessorAndBackupFailurePreservesBothSources() async throws {
+        for failBackup in [false, true] {
+            let context = try makeDeliveryContext()
+            let transport = CloudJournalTransport()
+            var firstEnvironment = context.environment(transport: transport)
+            firstEnvironment.synchronizeCacheFile = { _ in throw CocoaError(.fileWriteUnknown) }
+            guard case .retained? = try await CloudDatabaseSaver.deliver(context.stored, reference: context.reference, environment: firstEnvironment) else {
+                return XCTFail("Keep a real acknowledged journal until durability can be reconfirmed")
+            }
+            let confirmed = try XCTUnwrap(PendingUploadQueue.readJournal(for: context.reference.id).first)
+            try context.base.write(to: context.cacheURL, options: .atomic)
+            var recovery = context.environment(transport: transport)
+            if failBackup { recovery.writeBackup = { _, _ in throw CocoaError(.fileWriteNoPermission) } }
+            if failBackup {
+                XCTAssertThrowsError(try CloudDatabaseSaver.recoverConfirmed(confirmed, reference: context.reference, environment: recovery))
+                XCTAssertEqual(try Data(contentsOf: context.cacheURL), context.base)
+                XCTAssertEqual(try PendingUploadQueue.readImmutablePayload(confirmed), context.payload)
+                XCTAssertEqual(try PendingUploadQueue.readJournal(for: context.reference.id).first?.marker, confirmed.marker)
+                XCTAssertEqual(backupContents(for: context.reference), [])
+                guard case .saved? = try CloudDatabaseSaver.recoverConfirmed(confirmed, reference: context.reference,
+                    environment: context.environment(transport: transport)) else { return XCTFail("Removing the backup fault must allow supported recovery") }
+            } else {
+                guard case .saved? = try CloudDatabaseSaver.recoverConfirmed(confirmed, reference: context.reference, environment: recovery) else {
+                    return XCTFail("A verified predecessor may be backed up and replaced")
+                }
+            }
+            XCTAssertEqual(backupContents(for: context.reference), [context.base])
+            XCTAssertEqual(try Data(contentsOf: context.cacheURL), context.payload)
+            XCTAssertTrue(try PendingUploadQueue.readJournal(for: context.reference.id).isEmpty)
+            XCTAssertEqual(transport.effects.uploads, [.init(bytes: context.payload, revision: "rev-1")])
+            XCTAssertEqual(transport.effects.metadataCalls, 1)
         }
-        let uploadedBytes = Data("uploaded-bytes".utf8)
-        try DatabaseListStore.cacheDatabaseCopy(uploadedBytes, for: reference)
+    }
 
-        let updated = try CloudSyncCoordinator.applyUploadedBytesAfterSave(
-            reference: reference,
-            bytes: uploadedBytes,
-            remoteMetadata: CloudFileMetadata(modifiedDate: .now, contentHash: nil, size: 64, rev: nil)
-        )
+    func testJournalDeliverySkipsBackupWhenCacheAlreadyHoldsUploadedBytes() async throws {
+        let context = try makeDeliveryContext()
+        let transport = CloudJournalTransport()
+        guard case .saved? = try await CloudDatabaseSaver.deliver(context.stored, reference: context.reference,
+            environment: context.environment(transport: transport)) else { return XCTFail("Expected delivery") }
+        XCTAssertEqual(backupContents(for: context.reference), [])
+        XCTAssertEqual(try Data(contentsOf: context.cacheURL), context.payload)
+        XCTAssertEqual(transport.effects.uploads, [.init(bytes: context.payload, revision: "rev-1")])
+        XCTAssertTrue(try PendingUploadQueue.readJournal(for: context.reference.id).isEmpty)
+    }
 
+    func testJournalDeliveryKeepsRecordedRevAndHashWhenResponseOmitsThem() async throws {
+        let context = try makeDeliveryContext(hash: "hash-A", revision: "rev-A")
+        let transport = CloudJournalTransport(revision: "rev-A",
+            response: .init(modifiedDate: .now, contentHash: nil, size: 64, rev: nil))
+        guard case .saved(let updated)? = try await CloudDatabaseSaver.deliver(context.stored, reference: context.reference,
+            environment: context.environment(transport: transport)) else { return XCTFail("Expected delivery") }
         XCTAssertEqual(updated.cloudSyncMetadata?.remoteRev, "rev-A")
         XCTAssertEqual(updated.cloudSyncMetadata?.remoteContentHash, "hash-A")
+        XCTAssertEqual(try Data(contentsOf: context.cacheURL), context.payload)
+        XCTAssertEqual(transport.effects.uploads, [.init(bytes: context.payload, revision: "rev-A")])
     }
 
-    func testApplyUploadedBytesPreservesAutoFillDestinationSelectedDuringUpload() throws {
+    func testJournalDeliveryPreservesAutoFillDestinationSelectedDuringUpload() async throws {
         let oldGroup = KPGroup(name: "Old destination")
         let selectedGroup = KPGroup(name: "Selected during upload")
-        let root = KPGroup(name: "Root", groups: [
-            KPGroup(name: "Vault", groups: [oldGroup, selectedGroup])
-        ])
-        var reference = makeCloudReference(remoteContentHash: "hash-before", remoteModifiedAt: nil)
-        reference.autoFillDestinationGroupID = oldGroup.id
-        reference.updateCloudSyncMetadata { $0.remoteRev = "rev-before" }
-        DatabaseListStore.update(reference)
-        try DatabaseListStore.cacheDatabaseCopy(Data("before-upload".utf8), for: reference)
-
-        // The cloud saver captures this value before awaiting its upload.
-        let uploadReference = try XCTUnwrap(DatabaseListStore.databases.first { $0.id == reference.id })
-        DatabaseListStore.setAutoFillDestinationGroupID(selectedGroup.id, for: reference)
-
-        let uploadedBytes = Data("uploaded-ciphertext".utf8)
-        let appliedReference = try CloudSyncCoordinator.applyUploadedBytesAfterSave(
-            reference: uploadReference,
-            bytes: uploadedBytes,
-            remoteMetadata: CloudFileMetadata(
-                modifiedDate: Date(timeIntervalSince1970: 500),
-                contentHash: "hash-after",
-                size: Int64(uploadedBytes.count),
-                rev: "rev-after"
-            )
-        )
-
-        let storedReference = try XCTUnwrap(DatabaseListStore.databases.first { $0.id == reference.id })
-        XCTAssertEqual(try Data(contentsOf: DatabaseListStore.cacheLocation(for: reference)), uploadedBytes)
-        XCTAssertEqual(storedReference.cloudSyncMetadata?.remoteRev, "rev-after")
-        XCTAssertEqual(storedReference.cloudSyncMetadata?.remoteContentHash, "hash-after")
+        let root = KPGroup(name: "Root", groups: [KPGroup(name: "Vault", groups: [oldGroup, selectedGroup])])
+        let context = try makeDeliveryContext(hash: "hash-before", revision: "rev-before")
+        DatabaseListStore.setAutoFillDestinationGroupID(oldGroup.id, for: context.reference)
+        let transport = CloudJournalTransport(revision: "rev-before", beforeUpload: {
+            DatabaseListStore.setAutoFillDestinationGroupID(selectedGroup.id, for: context.reference)
+        })
+        guard case .saved(let appliedReference)? = try await CloudDatabaseSaver.deliver(context.stored, reference: context.reference,
+            environment: context.environment(transport: transport)) else { return XCTFail("Expected delivery") }
+        let storedReference = try XCTUnwrap(DatabaseListStore.databases.first { $0.id == context.reference.id })
+        XCTAssertEqual(try Data(contentsOf: context.cacheURL), context.payload)
+        XCTAssertEqual(storedReference.cloudSyncMetadata?.remoteRev, "rev-2")
+        XCTAssertEqual(storedReference.cloudSyncMetadata?.remoteContentHash, "uploaded-hash")
         XCTAssertEqual(storedReference.autoFillDestinationGroupID, selectedGroup.id)
         XCTAssertEqual(appliedReference.autoFillDestinationGroupID, selectedGroup.id)
-        XCTAssertEqual(
-            AutoFillSaveCoordinator.destinationGroup(
-                in: root,
-                preferredGroupID: storedReference.autoFillDestinationGroupID
-            ).id,
-            selectedGroup.id
-        )
+        XCTAssertEqual(AutoFillSaveCoordinator.destinationGroup(in: root,
+            preferredGroupID: storedReference.autoFillDestinationGroupID).id, selectedGroup.id)
+        XCTAssertEqual(transport.effects.uploads, [.init(bytes: context.payload, revision: "rev-before")])
     }
 
-    func testApplyUploadedBytesDoesNotRestoreRemovedDatabase() throws {
-        var reference = makeCloudReference(remoteContentHash: "hash-before", remoteModifiedAt: nil)
-        reference.updateCloudSyncMetadata { $0.remoteRev = "rev-before" }
+    func testJournalDeliveryDoesNotRestoreRemovedDatabase() async throws {
+        let context = try makeDeliveryContext()
+        let transport = CloudJournalTransport(beforeUpload: { DatabaseListStore.remove(id: context.reference.id) })
+        do {
+            _ = try await CloudDatabaseSaver.deliver(context.stored, reference: context.reference, environment: context.environment(transport: transport))
+            XCTFail("Removal revokes publication")
+        } catch { XCTAssertEqual(error as? SaveError, .saveContextUnavailable) }
+        XCTAssertFalse(DatabaseListStore.databases.contains { $0.id == context.reference.id })
+        XCTAssertFalse(FileManager.default.fileExists(atPath: context.cacheURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: try context.payloadURL.path))
+        XCTAssertTrue(try PendingUploadQueue.readJournal(for: context.reference.id).isEmpty)
+        do {
+            _ = try await CloudDatabaseSaver.deliver(context.stored, reference: context.reference,
+                environment: context.environment(transport: transport))
+            XCTFail("A stale snapshot cannot reacquire removed ownership")
+        } catch { XCTAssertEqual(error as? SaveError, .saveContextUnavailable) }
+        XCTAssertEqual(transport.effects.uploads.count, 1)
+    }
+
+    private func makeDeliveryContext(hash: String? = nil, revision: String = "rev-1") throws -> CloudJournalTestContext {
+        var reference = makeCloudReference(remoteContentHash: hash, remoteModifiedAt: nil)
+        reference.updateCloudSyncMetadata { $0.remoteRev = revision }
         DatabaseListStore.update(reference)
-        DatabaseListStore.remove(id: reference.id)
-
-        let completed = try CloudSyncCoordinator.applyUploadedBytesAfterSave(
-            reference: reference,
-            bytes: Data("uploaded-ciphertext".utf8),
-            remoteMetadata: CloudFileMetadata(
-                modifiedDate: Date(timeIntervalSince1970: 500),
-                contentHash: "hash-after",
-                size: 19,
-                rev: "rev-after"
-            )
-        )
-
-        XCTAssertFalse(DatabaseListStore.databases.contains { $0.id == reference.id })
-        XCTAssertEqual(completed.cloudSyncMetadata?.remoteRev, "rev-after")
-        XCTAssertEqual(completed.cloudSyncMetadata?.remoteContentHash, "hash-after")
+        return try CloudJournalTestContext(reference: reference)
     }
 
     func testDiscardConflictedPendingUploadsBacksUpLivePayloadAndDropsOnlyConflictedMarkers() async throws {

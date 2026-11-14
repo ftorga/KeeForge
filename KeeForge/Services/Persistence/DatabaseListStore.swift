@@ -1111,31 +1111,43 @@ enum DatabaseListStore {
 
     /// Cache coordination precedes an immediate list/commit-lock attempt; contention rejects publication.
     static func withCloudKeyPublication<T>(
-        for expected: DatabaseReference, sha512: Data, _ publish: () throws -> T
+        for expected: DatabaseReference, sha512: Data, permit: KeyCommitPublicationPermit,
+        io: KeyCommitPublicationIO = .init(), _ publish: () throws -> T
     ) throws -> T {
+        defer { permit.close() }
+        guard permit.state == .pending else { throw SaveError.saveContextUnavailable }
         let cache = cacheLocation(for: expected)
         var result: Result<T, Error>?
-        var coordinationError: NSError?
-        NSFileCoordinator().coordinate(readingItemAt: cache, error: &coordinationError) { protectedCache in
-            result = Result {
-                let bytes = try Data(contentsOf: protectedCache)
-                guard FileDigest.sha512(bytes) == sha512, stateLock.try() else { throw SaveError.saveContextUnavailable }
-                defer { stateLock.unlock() }
-                let references = try JSONDecoder().decode([DatabaseReference].self, from: Data(contentsOf: databaseListURL))
-                guard let current = references.first(where: { $0.id == expected.id }),
-                      current.cloudSyncMetadata?.keyEpoch == expected.cloudSyncMetadata?.keyEpoch,
-                      current.lastMasterKeyChangeAt == expected.lastMasterKeyChangeAt,
-                      current.keyFileBookmarkData == expected.keyFileBookmarkData,
-                      current.keyFileFilename == expected.keyFileFilename,
-                      current.cloudSyncMetadata?.fileId == expected.cloudSyncMetadata?.fileId,
-                      current.cloudSyncMetadata?.accountId == expected.cloudSyncMetadata?.accountId,
-                      current.cloudSyncMetadata?.provider == expected.cloudSyncMetadata?.provider else { throw SaveError.saveContextUnavailable }
-                return try PendingUploadQueue.withCommitLock(for: current.id, nonBlocking: true) {
-                    guard try PendingUploadQueue.readJournal(for: current.id).isEmpty else { throw SaveError.saveContextUnavailable }
-                    return try PendingLocalSaveStore.withCachePublicationAuthorization(for: current.id, sha512: sha512, publish)
+        var coordinationError: Error?
+        do {
+            try io.coordinate(cache, databaseListURL) { protectedCache, registry in
+                result = Result {
+                    guard permit.state == .pending else { throw SaveError.saveContextUnavailable }
+                    let bytes = try io.read(protectedCache)
+                    guard FileDigest.sha512(bytes) == sha512, stateLock.try() else { throw SaveError.saveContextUnavailable }
+                    defer { stateLock.unlock() }
+                    let references = try JSONDecoder().decode([DatabaseReference].self, from: Data(contentsOf: registry))
+                    guard let current = references.first(where: { $0.id == expected.id }),
+                          current.cloudSyncMetadata?.keyEpoch == expected.cloudSyncMetadata?.keyEpoch,
+                          current.lastMasterKeyChangeAt == expected.lastMasterKeyChangeAt,
+                          current.keyFileBookmarkData == expected.keyFileBookmarkData,
+                          current.keyFileFilename == expected.keyFileFilename,
+                          current.legacyKeychainFilename == expected.legacyKeychainFilename,
+                          current.hardwareKey == expected.hardwareKey,
+                          current.cloudSyncMetadata?.fileId == expected.cloudSyncMetadata?.fileId,
+                          current.cloudSyncMetadata?.accountId == expected.cloudSyncMetadata?.accountId,
+                          current.cloudSyncMetadata?.provider == expected.cloudSyncMetadata?.provider else { throw SaveError.saveContextUnavailable }
+                    return try PendingUploadQueue.withCommitLock(for: current.id, nonBlocking: true) {
+                        guard try PendingUploadQueue.readJournal(for: current.id).isEmpty else { throw SaveError.saveContextUnavailable }
+                        return try PendingLocalSaveStore.withCachePublicationAuthorization(for: current.id, sha512: sha512) {
+                            try io.beforeEffect()
+                            guard permit.claim() else { throw SaveError.saveContextUnavailable }
+                            return try publish()
+                        }
+                    }
                 }
             }
-        }
+        } catch { coordinationError = error }
         if let result { return try result.get() }
         throw coordinationError ?? CocoaError(.fileReadUnknown)
     }

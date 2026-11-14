@@ -66,10 +66,7 @@ enum PendingUploadQueue {
         /// (any marker written before this field existed) is re-checked rather
         /// than pushed blind.
         var isConflicted: Bool = false
-        /// Remote revision the payload was derived from (the reference's rev
-        /// when the saving process opened the database). The drainer only
-        /// auto-rebases a conflicted marker when this equals the remote head.
-        /// Legacy markers decode as `nil`, disabling auto-rebase for them.
+        /// Recorded remote ancestry; legacy markers decode nil and never gain byte identity from it.
         var baseRev: String?
 
         var journalVersion: Int?
@@ -428,16 +425,7 @@ enum PendingUploadQueue {
         }
     }
 
-    /// Phase 3 of the AutoFill two-phase marker: records the saved payload's
-    /// hash on the marker as it is on disk now, not as the extension read it.
-    /// A drainer that ran between the cache write and this call has already
-    /// bumped the generation and flagged the marker conflicted, because the
-    /// cache no longer matched the provisional base hash. A generation-checked
-    /// `update` would then fail and leave that provisional marker behind for
-    /// good, which makes every later recovery lookup `.unavailable`. The
-    /// conflict flag is cleared because the hash it was raised against is
-    /// gone; the drainer re-checks the finalized marker on its next pass.
-    /// The drainer's own changes (`expectedRev`, `baseRev`) are kept.
+    /// Finalization rereads the current generation so an intervening conflict update cannot strand the payload.
     static func finalize(_ storedMarker: StoredMarker) throws -> StoredMarker {
         try finalize(storedMarker, environment: .live)
     }

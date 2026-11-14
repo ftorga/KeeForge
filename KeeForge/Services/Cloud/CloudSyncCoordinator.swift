@@ -261,7 +261,7 @@ enum CloudSyncCoordinator {
         }
 
         // Pin the cache BEFORE the transfer starts. A save that lands while
-        // the download is in flight (an app save's `applyUploadedBytesAfterSave`,
+        // the download is in flight (an app save,
         // an AutoFill save) writes bytes newer than the ones arriving, and the
         // pin is what makes the publish below refuse to revert them. Pinning
         // after the download would pin the save's bytes and replace them.
@@ -537,48 +537,4 @@ enum CloudSyncCoordinator {
         }.value
     }
 
-    static func applyUploadedBytesAfterSave(
-        reference: DatabaseReference,
-        bytes: Data,
-        remoteMetadata: CloudFileMetadata
-    ) throws -> DatabaseReference {
-        let cacheURL = DatabaseListStore.cacheLocation(for: reference)
-        let currentReference = DatabaseListStore.databases.first { $0.id == reference.id } ?? reference
-        guard let currentBytes = try? CoordinatedFileReader.readData(from: cacheURL),
-              FileDigest.sha512(currentBytes) == FileDigest.sha512(bytes),
-              currentReference.cloudSyncMetadata?.localHeadOperationID == reference.cloudSyncMetadata?.localHeadOperationID else {
-            return currentReference
-        }
-
-        let applyRemoteMetadata: (inout CloudSyncMetadata) -> Void = { cloudMetadata in
-            // An upload response can omit rev/hash (OneDrive session
-            // completions). Nilling a good recorded value would send every
-            // later save into the nil-rev conflict fallback.
-            if let contentHash = remoteMetadata.contentHash {
-                cloudMetadata.remoteContentHash = contentHash
-            }
-            cloudMetadata.remoteModifiedAt = remoteMetadata.modifiedDate
-            if let rev = remoteMetadata.rev {
-                cloudMetadata.remoteRev = rev
-            }
-            cloudMetadata.lastSyncedAt = PendingUploadQueue.listMarkers(for: reference.id).isEmpty ? .now : nil
-            cloudMetadata.lastSyncIssue = nil
-        }
-
-        if let observedMetadata = reference.cloudSyncMetadata,
-           let updatedReference = DatabaseListStore.updateCloudSyncMetadata(
-               for: reference.id,
-               ifUnchangedFrom: observedMetadata,
-               mutate: applyRemoteMetadata
-           ) {
-            return updatedReference
-        }
-
-        // The database can be removed from the list while its upload is in
-        // flight. Return the completed upload state to the caller without
-        // silently adding the removed database again.
-        var uploadedReference = reference
-        uploadedReference.updateCloudSyncMetadata(applyRemoteMetadata)
-        return uploadedReference
-    }
 }

@@ -26,6 +26,41 @@ final class DatabaseViewModelCloudSyncTests: XCTestCase {
         try await super.tearDown()
     }
 
+    func testValidCloudCacheUnlocksDuringUnavailableRecoveryButMutationAndKeyPublicationStayClosed() async throws {
+        let bytes = try KDBXTestFixture.test.data(in: Bundle(for: Self.self))
+        for fault in CloudJournalReadFault.allCases {
+            let reference = try makeStoredManualReference(fileID: "/Vaults/recovery-\(fault).kdbx", autoFillEnabled: false)
+            let context = try CloudJournalTestContext(reference: reference, base: bytes, payload: bytes)
+            try fault.install(in: context)
+            let effects = CloudJournalEffectCounter()
+            let vm = DatabaseViewModel(databaseReference: reference,
+                cloudSyncOperation: { reference, _ in
+                    try await CloudSyncCoordinator.syncIfNeededForOpen(reference: reference, providerResolver: { _ in nil })
+                }, quickUnlockKeyPersistOperation: { _, _, _ in effects.record(); return true })
+            await vm.unlock(password: KDBXTestFixture.test.password)
+            defer { vm.lock() }
+            XCTAssertEqual(vm.state, .unlocked)
+            XCTAssertFalse(vm.rootGroup?.allEntries.isEmpty ?? true)
+            XCTAssertEqual(effects.value, 0)
+            let session = SymmetricKey(size: .bits256)
+            let parsed = try KDBXParser.parseWithMeta(data: bytes, password: KDBXTestFixture.test.password, sessionKey: session)
+            let draft = DatabaseDraft(rootGroup: parsed.rootGroup, meta: parsed.meta, sessionKey: session)
+            do {
+                _ = try await CloudDatabaseSaver.save(draft: draft, reference: reference,
+                    compositeKey: KDBXTestFixture.test.compositeKey(in: Bundle(for: Self.self)),
+                    openTimeSHA512: FileDigest.sha512(bytes), expectedRev: reference.expectedCloudRevision,
+                    environment: context.environment())
+                XCTFail("Unavailable recovery cannot authorize another local mutation")
+            } catch { XCTAssertTrue(error is CloudSaveRecoveryWarning || error is SaveError) }
+            let transport = CloudJournalTransport()
+            let outcome = await PendingUploadDrainer(environment: context.drainerEnvironment(saver: context.environment(transport: transport))).drainAll()
+            XCTAssertFalse(outcome.conflictDatabaseIDs.isEmpty)
+            XCTAssertTrue(transport.effects.uploads.isEmpty)
+            XCTAssertEqual(try Data(contentsOf: context.cacheURL), bytes)
+            XCTAssertFalse(PendingUploadQueue.listMarkers(for: reference.id).isEmpty)
+        }
+    }
+
     func testSyncAndConflictOnOneDatabasePreserveTheOtherSessionsCloudState() async throws {
         let openedData = try KDBXTestFixture.test.data(in: Bundle(for: Self.self))
         let newerData = try KDBXTestFixture.kitchenSink.data(in: Bundle(for: Self.self))
@@ -73,7 +108,17 @@ final class DatabaseViewModelCloudSyncTests: XCTestCase {
                     draft: EntryDraftPayload(title: "A conflict", password: "secret")
                 ))
                 try await first.save()
-                XCTAssertNotNil(first.saveConflict)
+                let marker = try XCTUnwrap(PendingUploadQueue.readJournal(for: firstReference.id).first)
+                var delivery = CloudDatabaseSaver.Environment.live
+                delivery.getMetadata = { _ in remote.currentMetadata }
+                delivery.downloadRemoteData = { _ in remote.currentBytes }
+                delivery.upload = { _, bytes, rev, _ in try remote.store(bytes, expectedRev: rev) }
+                guard case .conflict? = try await CloudDatabaseSaver.deliver(marker, reference: firstReference, environment: delivery) else {
+                    return XCTFail("Remote divergence must retain the first session's encrypted output")
+                }
+                XCTAssertTrue(first.hasPendingCloudUploads)
+                XCTAssertEqual(try PendingUploadQueue.readImmutablePayload(marker),
+                    try Data(contentsOf: DatabaseListStore.cacheLocation(for: firstReference)))
             } else {
                 await first.syncCloudNow()
                 XCTAssertEqual(first.cloudSyncOutcome, .upToDate)
@@ -463,7 +508,7 @@ final class DatabaseViewModelCloudSyncTests: XCTestCase {
             cloudSaveOperation: { _, reference, _, _, _, _, _, _ in
                 await saveGate.signalStarted()
                 await saveGate.waitUntilOpen()
-                // What `applyUploadedBytesAfterSave` records once the upload lands.
+                // What journal delivery records once the upload lands.
                 let observed = try XCTUnwrap(reference.cloudSyncMetadata)
                 _ = DatabaseListStore.updateCloudSyncMetadata(for: reference.id, ifUnchangedFrom: observed) { metadata in
                     metadata.remoteRev = "rev-C"

@@ -432,6 +432,15 @@ final class DatabaseCreationServiceTests: XCTestCase {
             do { _ = try await CloudFileCreationCoordinator.resume(operationID: intent.operationID, environment: resumeEnvironment); XCTFail("Uncertain create must never resend") }
             catch { XCTAssertTrue(error is CloudFileCreationCoordinator.RecoveryRequired) }
         }
+        var drainEnvironment = PendingUploadDrainer.Environment.live
+        drainEnvironment.beginBackgroundTask = { _ in .invalid }
+        drainEnvironment.endBackgroundTask = { _ in }
+        drainEnvironment.deliverMarker = { _, _ in XCTFail("Creation cannot enter replacement delivery"); return nil }
+        _ = await PendingUploadDrainer(environment: drainEnvironment).drainAll()
+        var failedExport = CloudFileCreationCoordinator.Environment.live
+        failedExport.queue.readData = { _ in throw CocoaError(.fileReadNoPermission) }
+        XCTAssertThrowsError(try CloudFileCreationCoordinator.export(intent, environment: failedExport))
+        XCTAssertEqual(try PendingUploadQueue.listCreations().first, intent)
         XCTAssertEqual(recorder.callCount, 1)
         XCTAssertEqual(try CloudFileCreationCoordinator.export(intent), bytes)
         XCTAssertEqual(try PendingUploadQueue.listCreations().first?.phase, .attempting)
@@ -458,14 +467,24 @@ final class DatabaseCreationServiceTests: XCTestCase {
             for await _ in release.stream { break }
             return try await recorder.createFile(provider: provider, accountId: accountID, path: path, data: data, progress: progress)
         }
+        let completed = XCTestExpectation(description: "Create worker fully terminated")
         let worker = Task {
-            try await DatabaseCreationService.create(request: .init(displayName: "Paused creation",
+            defer { completed.fulfill() }
+            return try await DatabaseCreationService.create(request: .init(displayName: "Paused creation",
                 destination: .cloud(provider: CloudProviderKind.dropbox.rawValue, accountId: "paused-account", folderPath: nil),
                 password: "paused key"), environment: environment)
         }
-        await fulfillment(of: [started], timeout: 15)
+        let entered = await XCTWaiter.fulfillment(of: [started], timeout: 15)
         worker.cancel()
         release.continuation.yield(())
+        release.continuation.finish()
+        let joined = await XCTWaiter.fulfillment(of: [completed], timeout: 15)
+        if joined != .completed {
+            XCTFail("Creation worker did not quiesce after cancellation and all gates were released")
+            // Never tear down shared storage beneath an unquiesced test worker.
+            fatalError("Creation test worker failed bounded termination")
+        }
+        XCTAssertEqual(entered, .completed)
         do { _ = try await worker.value; XCTFail("Abandoned foreground cannot register its late response") }
         catch { XCTAssertTrue(error is CancellationError) }
         let intent = try XCTUnwrap(PendingUploadQueue.listCreations().first)
@@ -473,10 +492,55 @@ final class DatabaseCreationServiceTests: XCTestCase {
         XCTAssertTrue(intent.isPaused)
         XCTAssertNotNil(intent.receipt)
         XCTAssertTrue(DatabaseListStore.databases.isEmpty)
+        var drainEnvironment = PendingUploadDrainer.Environment.live
+        drainEnvironment.beginBackgroundTask = { _ in .invalid }
+        drainEnvironment.endBackgroundTask = { _ in }
+        drainEnvironment.deliverMarker = { _, _ in XCTFail("Abandoned creation is not an upload marker"); return nil }
+        _ = await PendingUploadDrainer(environment: drainEnvironment).drainAll()
+        XCTAssertEqual(try PendingUploadQueue.listCreations().first, intent)
+        XCTAssertEqual(recorder.callCount, 1)
+        XCTAssertTrue(DatabaseListStore.databases.isEmpty)
         let registered = try await CloudFileCreationCoordinator.resume(operationID: intent.operationID)
         XCTAssertEqual(registered.id, intent.referenceTemplate.id)
         XCTAssertEqual(try Data(contentsOf: DatabaseListStore.cacheLocation(for: registered)), recorder.uploadedData)
         XCTAssertEqual(recorder.callCount, 1)
+    }
+
+    func testExplicitPreparedCreationResumesTheSameEncryptedOwnershipOnce() async throws {
+        let bytes = try KDBXTestFixture.test.data(in: Bundle(for: Self.self))
+        let reference = DatabaseReference(id: UUID(), filename: "prepared.kdbx", bookmarkData: nil, isQuickLaunch: false, addedAt: .now)
+        let calls = CloudJournalEffectCounter()
+        let recorder = CloudCreateRecorder()
+        var environment = CloudFileCreationCoordinator.Environment.live
+        environment.createFile = { provider, accountID, path, data in
+            calls.record()
+            if calls.value == 1 { throw CloudUploadFailure(underlying: .networkUnavailable, outcome: .notDispatched) }
+            return try await recorder.createFile(provider: provider, accountId: accountID, path: path, data: data, progress: { _ in })
+        }
+        let operation = UUID()
+        do {
+            _ = try await CloudFileCreationCoordinator.create(operationID: operation, ownerDatabaseID: reference.id,
+                provider: CloudProviderKind.dropbox.rawValue, accountID: "prepared", target: "/prepared.kdbx",
+                bytes: bytes, referenceTemplate: reference, environment: environment)
+            XCTFail("Proven predispatch failure retains preparation")
+        } catch { XCTAssertTrue(error is CloudFileCreationCoordinator.RecoveryRequired) }
+        let prepared = try XCTUnwrap(PendingUploadQueue.listCreations().first)
+        XCTAssertEqual(prepared.phase, .prepared)
+        XCTAssertEqual(try CloudFileCreationCoordinator.export(prepared), bytes)
+        var draining = PendingUploadDrainer.Environment.live
+        draining.beginBackgroundTask = { _ in .invalid }
+        draining.endBackgroundTask = { _ in }
+        _ = await PendingUploadDrainer(environment: draining).drainAll()
+        XCTAssertEqual(calls.value, 1)
+        XCTAssertTrue(DatabaseListStore.databases.isEmpty)
+        let registered = try await CloudFileCreationCoordinator.resume(operationID: operation, environment: environment)
+        XCTAssertEqual(registered.id, reference.id)
+        XCTAssertEqual(calls.value, 2)
+        XCTAssertEqual(recorder.callCount, 1)
+        XCTAssertEqual(recorder.uploadedData, bytes)
+        XCTAssertEqual(try Data(contentsOf: DatabaseListStore.cacheLocation(for: registered)), bytes)
+        _ = try await CloudFileCreationCoordinator.resume(operationID: operation, environment: environment)
+        XCTAssertEqual(calls.value, 2)
     }
 
     func testCreateDropboxDatabaseUploadsCachesAndRegistersCloudReference() async throws {

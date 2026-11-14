@@ -664,46 +664,6 @@ enum CloudDatabaseSaver {
         return true
     }
 
-    static func pushPendingUpload(
-        reference: DatabaseReference,
-        encryptedBytes: Data,
-        expectedRev: String?
-    ) async throws -> PendingUploadPushResult {
-        try await pushPendingUpload(
-            reference: reference,
-            encryptedBytes: encryptedBytes,
-            expectedRev: expectedRev,
-            environment: .live
-        )
-    }
-
-    static func pushPendingUpload(
-        reference: DatabaseReference,
-        encryptedBytes: Data,
-        expectedRev: String?,
-        environment: Environment
-    ) async throws -> PendingUploadPushResult {
-        guard reference.cloudSyncMetadata != nil else {
-            throw SaveError.saveContextUnavailable
-        }
-
-        let backgroundTaskHandle = await environment.beginBackgroundTask("PendingUploadDraining")
-        defer {
-            Task { @MainActor in
-                environment.endBackgroundTask(backgroundTaskHandle)
-            }
-        }
-
-        return try await Task.detached(priority: .utility) {
-            try await pushPendingUploadOffMain(
-                reference: reference,
-                encryptedBytes: encryptedBytes,
-                expectedRev: expectedRev,
-                environment: environment
-            )
-        }.value
-    }
-
     /// Whether the remote head differs from the state this save was based on —
     /// the conflict-versus-upload gate. A recorded rev makes it exact. A nil
     /// rev is common (pre-rev-tracking references, offline opens, ETag-less
@@ -712,39 +672,6 @@ enum CloudDatabaseSaver {
     /// `WriteMode.overwrite`, OneDrive `conflictBehavior=replace` without
     /// `If-Match`). So nil falls back to metadata: the reported content hash
     /// must match the recorded one, and an unrecorded rev is conflict-suspect.
-    /// Residue: a bare WebDAV server exposing neither rev nor hash offers
-    /// nothing to verify against; closing that needs a remote-byte compare.
-    static func remoteHasDiverged(
-        recorded: CloudSyncMetadata,
-        remote: CloudFileMetadata,
-        expectedRev: String?
-    ) -> Bool {
-        if let expectedRev {
-            return remote.rev != expectedRev
-        }
-
-        if let remoteContentHash = remote.contentHash {
-            return remoteContentHash != recorded.remoteContentHash
-        }
-
-        return remote.rev != nil
-    }
-
-    private static func pushPendingUploadOffMain(
-        reference: DatabaseReference,
-        encryptedBytes: Data,
-        expectedRev: String?,
-        environment: Environment
-    ) async throws -> PendingUploadPushResult {
-        guard let stored = PendingUploadQueue.listMarkers(for: reference.id, environment: environment.queue).first(where: {
-            $0.marker.isPayloadFinalized == true && $0.marker.openTimeSHA512 == FileDigest.sha512(encryptedBytes)
-        }) else { throw SaveError.saveContextUnavailable }
-        guard let result = try await deliver(stored, reference: reference, environment: environment) else {
-            throw CloudProviderError.serviceUnavailable
-        }
-        return result
-    }
-
     private static func backupFilename(for date: Date) -> String {
         let utcCalendar = Calendar(identifier: .gregorian)
         let utcTimeZone = TimeZone(secondsFromGMT: 0) ?? .current
