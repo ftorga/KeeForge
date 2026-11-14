@@ -51,7 +51,11 @@ final class DropboxCloudProviderTests: XCTestCase {
         do {
             _ = try await CloudDatabaseSaver.deliver(context.stored, reference: reference, environment: environment)
             XCTFail("An accepted write with a lost acknowledgement cannot settle")
-        } catch { XCTAssertNotNil(error as? DropboxCloudProvider.TransientFailure) }
+        } catch {
+            let cause = error as NSError
+            XCTAssertNotNil(error as? DropboxCloudProvider.TransientFailure,
+                "SDK cause domain=\(cause.domain) code=\(cause.code), intercepted=\(transport.requests.count)")
+        }
         let retained = try XCTUnwrap(PendingUploadQueue.readJournal(for: reference.id).first)
         XCTAssertEqual(CloudJournalDecision.state(of: retained.marker), .attempting)
         for _ in 0..<2 {
@@ -349,7 +353,7 @@ private final class DropboxHTTPProbe: @unchecked Sendable {
         configuration.timeoutIntervalForRequest = 5
         configuration.timeoutIntervalForResource = 5
         return DropboxClient(transportClient: DropboxTransportClientImpl(accessToken: "unit-transport-only",
-            baseHosts: BaseHosts(apiHost: host, contentHost: host, notifyHost: host), sessionConfiguration: configuration))
+            baseHosts: BaseHosts(apiHost: "https://\(host)", contentHost: "https://\(host)", notifyHost: "https://\(host)"), sessionConfiguration: configuration))
     }
 
     func close() { DropboxProbeURLProtocol.remove(host: host) }

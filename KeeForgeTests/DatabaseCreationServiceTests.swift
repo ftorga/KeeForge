@@ -602,9 +602,17 @@ final class DatabaseCreationServiceTests: XCTestCase {
                 environment: environment
             )
             XCTFail("Expected upload failure.")
-        } catch CloudProviderError.networkUnavailable {
+        } catch let failure as CloudFileCreationCoordinator.RecoveryRequired {
             XCTAssertTrue(DatabaseListStore.databases.isEmpty)
             XCTAssertEqual(recorder.uploadedPath, "/Upload Failure.kdbx")
+            let retained = try XCTUnwrap(PendingUploadQueue.listCreations().first)
+            XCTAssertEqual(retained.operationID, failure.operationID)
+            XCTAssertEqual(retained.phase, .attempting)
+            XCTAssertNil(retained.receipt)
+            XCTAssertEqual(recorder.callCount, 1)
+            let exported = try CloudFileCreationCoordinator.export(retained)
+            XCTAssertEqual(exported, recorder.uploadedData)
+            _ = try KDBXParser.parseWithMeta(data: exported, password: "dropbox failure password", sessionKey: SymmetricKey(size: .bits256))
         } catch {
             XCTFail("Unexpected error: \(error)")
         }

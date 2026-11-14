@@ -172,6 +172,9 @@ final class CloudDatabaseSaverTests: XCTestCase {
             environment: environment
         )
 
+        guard case .saved? = try await deliverQueuedSave(reference: reference, environment: environment) else {
+            return XCTFail("The real queued Twofish save must deliver before inspecting uploaded bytes")
+        }
         let uploadCall = await recorder.firstCall()
         let uploaded = try XCTUnwrap(uploadCall?.data)
         let reparsed = try KDBXParser.parseWithMetaAndHeader(

@@ -289,15 +289,17 @@ final class PendingUploadDrainerTests: XCTestCase {
         let context = try makeContext()
         let transport = CloudJournalTransport()
         var faulty = context.environment(transport: transport)
+        let faultReached = CloudJournalEffectCounter()
         let remove = faulty.queue.removeItem
         faulty.queue.removeItem = { url in
-            if url == context.stored.fileURL { throw CocoaError(.fileWriteNoPermission) }
+            if url.resolvingSymlinksInPath().standardizedFileURL == context.stored.fileURL.resolvingSymlinksInPath().standardizedFileURL { faultReached.record(); throw CocoaError(.fileWriteNoPermission) }
             try remove(url)
         }
         do {
             _ = try await CloudDatabaseSaver.deliver(context.stored, reference: context.reference, environment: faulty)
             XCTFail("A failed journal retirement cannot report complete")
         } catch { XCTAssertEqual((error as? CocoaError)?.code, .fileWriteNoPermission) }
+        XCTAssertGreaterThan(faultReached.value, 0)
         let confirmed = try XCTUnwrap(PendingUploadQueue.readJournal(for: context.reference.id).first)
         XCTAssertEqual(CloudJournalDecision.state(of: confirmed.marker), .confirmed)
         XCTAssertEqual(try PendingUploadQueue.readImmutablePayload(confirmed), context.payload)
@@ -389,10 +391,11 @@ final class PendingUploadDrainerTests: XCTestCase {
         for corrupt in [false, true] {
             let context = try makeContext()
             let original = try Data(contentsOf: context.stored.fileURL)
+            let faultReached = CloudJournalEffectCounter()
             var saver = context.environment()
             if corrupt {
                 saver.queue.readData = { url in
-                    if url == context.stored.fileURL { throw CocoaError(.fileReadNoPermission) }
+                    if url.resolvingSymlinksInPath().standardizedFileURL == context.stored.fileURL.resolvingSymlinksInPath().standardizedFileURL { faultReached.record(); throw CocoaError(.fileReadNoPermission) }
                     return try Data(contentsOf: url)
                 }
             } else {
@@ -405,7 +408,10 @@ final class PendingUploadDrainerTests: XCTestCase {
             do {
                 _ = try await CloudDatabaseSaver.deliver(context.stored, reference: context.reference, environment: saver)
                 XCTFail("Unreadable or unknown journal must not be treated as empty")
-            } catch {}
+            } catch {
+                XCTAssertEqual((error as? CocoaError)?.code, corrupt ? .fileReadNoPermission : .fileReadCorruptFile)
+            }
+            if corrupt { XCTAssertGreaterThan(faultReached.value, 0) }
             XCTAssertTrue(transport.effects.uploads.isEmpty)
             XCTAssertEqual(try Data(contentsOf: context.cacheURL), context.payload)
             XCTAssertEqual(try Data(contentsOf: context.payloadURL), context.payload)

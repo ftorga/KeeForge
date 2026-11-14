@@ -1611,6 +1611,10 @@ enum DatabaseListStore {
             try? FileManager.default.removeItem(at: backupsRootURL)
             try? PendingUploadQueue.clearAll()
             PendingLocalSaveStore.clearAll()
+            if AppGroupContainer.isRedirectedForTesting {
+                // Test teardown also owns caches whose unresolved journal refused ordinary reference removal.
+                try? FileManager.default.removeItem(at: SharedVaultStore.cloudCacheDirectory)
+            }
             activeAutoFillDatabaseID = nil
             sharedDefaults.removeObject(forKey: migrationVersionKey)
             #if DEBUG

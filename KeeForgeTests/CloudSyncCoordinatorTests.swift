@@ -645,6 +645,32 @@ final class CloudSyncCoordinatorTests: XCTestCase {
         return try CloudJournalTestContext(reference: reference)
     }
 
+    func testUnregisteredCloudResolutionCannotAdoptReferenceOrStartProviderIO() async throws {
+        let reference = makeCloudReference(remoteContentHash: nil, remoteModifiedAt: nil, register: false)
+        let provider = MockCloudProvider()
+        do {
+            _ = try await CloudSyncCoordinator.syncIfNeededForOpen(reference: reference, allowCachedFallback: false,
+                providerResolver: { _ in provider })
+            XCTFail("An unregistered snapshot cannot create resolution authority")
+        } catch { XCTAssertEqual(error as? SaveError, .saveContextUnavailable) }
+        XCTAssertTrue(DatabaseListStore.databases.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: DatabaseListStore.cacheLocation(for: reference).path))
+        XCTAssertEqual(provider.metadataCallCount, 0)
+        XCTAssertEqual(provider.downloadCallCount, 0)
+    }
+
+    func testTestContainerCleanupRemovesCachesWhoseActiveJournalRefusedReferenceRemoval() throws {
+        XCTAssertTrue(AppGroupContainer.isRedirectedForTesting)
+        guard AppGroupContainer.isRedirectedForTesting else { return XCTFail("Cleanup must never target the live container") }
+        let context = try makeDeliveryContext()
+        XCTAssertFalse(DatabaseListStore.remove(id: context.reference.id))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: context.cacheURL.path))
+        DatabaseListStore.clearAll()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: context.cacheURL.path))
+        XCTAssertTrue(PendingUploadQueue.listMarkers(for: context.reference.id).isEmpty)
+        XCTAssertTrue(DatabaseListStore.databases.isEmpty)
+    }
+
     func testDiscardCannotRetireAConflictedConfirmedDeliveryBeforeLocalReconciliation() async throws {
         let reference = makeCloudReference(remoteContentHash: nil, remoteModifiedAt: nil)
         DatabaseListStore.update(reference)
@@ -1172,7 +1198,8 @@ final class CloudSyncCoordinatorTests: XCTestCase {
 
     private func makeCloudReference(
         remoteContentHash: String?,
-        remoteModifiedAt: Date?
+        remoteModifiedAt: Date?,
+        register: Bool = true
     ) -> DatabaseReference {
         let reference = DatabaseReference(
             id: UUID(),
@@ -1199,7 +1226,7 @@ final class CloudSyncCoordinatorTests: XCTestCase {
                 )
             )
         )
-        DatabaseListStore.update(reference)
+        if register { DatabaseListStore.update(reference) }
         return reference
     }
 }
