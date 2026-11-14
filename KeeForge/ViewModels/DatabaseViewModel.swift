@@ -5284,11 +5284,14 @@ final class DatabaseViewModel {
         prefetchedCloudResolution: CloudSyncResolution? = nil
     ) async throws -> (url: URL, data: Data, cloudSyncStatus: CloudSyncResolution.Status?, cacheLease: PendingLocalSaveStore.CacheReadLease?, readProof: PendingLocalSaveStore.ReadKeyPublication?) {
         if databaseReference.isCloudBacked {
+            let observedReference = databaseReference
+            let observedCycle = lockCycleID
             let resolution = if let prefetchedCloudResolution {
                 prefetchedCloudResolution
             } else {
                 try await syncCloudCopyForOpenShowingProgress()
             }
+            guard observedCycle == lockCycleID, databaseReference == observedReference else { throw CancellationError() }
             visibleCloudSyncProgressID = nil
             cloudSyncProgress = nil
             cloudSyncBannerText = resolution.bannerMessage
@@ -5296,8 +5299,19 @@ final class DatabaseViewModel {
             isCloudRefreshPending = resolution.status == .refreshSkipped
             hasPendingCloudUploads = pendingUploadMarkerCheck(resolution.reference)
             unlockStatusMessage = Self.decryptingStatusMessage
-            DatabaseListStore.update(resolution.reference)
-            databaseReference = resolution.reference
+            let mergedReference = await Task.detached { () -> DatabaseReference? in
+                guard let observed = observedReference.cloudSyncMetadata,
+                      let learned = resolution.reference.cloudSyncMetadata else { return nil }
+                return DatabaseListStore.updateCloudSyncMetadata(for: observedReference.id, ifUnchangedFrom: observed) {
+                    $0.remoteContentHash = learned.remoteContentHash
+                    $0.remoteModifiedAt = learned.remoteModifiedAt
+                    $0.remoteRev = learned.remoteRev
+                    $0.lastSyncedAt = learned.lastSyncedAt
+                    $0.lastSyncIssue = learned.lastSyncIssue
+                }
+            }.value
+            guard observedCycle == lockCycleID, databaseReference == observedReference else { throw CancellationError() }
+            databaseReference = mergedReference ?? resolution.reference
             return (resolution.localURL, resolution.data, resolution.status, nil, nil)
         }
 

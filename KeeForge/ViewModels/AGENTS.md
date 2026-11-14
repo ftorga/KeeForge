@@ -119,3 +119,5 @@ Unit classes in `../../KeeForgeTests/` are named `<Type>Tests`. Cover success, f
 - An explicit local mutation may encounter this same unlocked action’s unapplied durable read renewal. Revoke its pending read-key permit, revalidate the original authenticated receipt under the existing bookmark-only fence and apply only bookmarkData before a new mutation action begins. Retain only that current observation alongside the existing ciphertext context; lock/new unlock/reload/known replacement clears it. Old action continuations cannot apply factors, SHA or secrets afterward.
 
 - A known cloud cache save completes its originating session and included-edit bookkeeping while journal delivery is queued. Optional express-key refresh defers until strict journal ownership is empty; the publication fence is never relaxed for pending work.
+
+- Cloud open completion merges only learned sync fields against the exact pre-await observed metadata. It never writes a captured whole reference over a later rekey, local head or removal, and a rejected metadata CAS supplies no current-epoch authority to the old parsed ciphertext.

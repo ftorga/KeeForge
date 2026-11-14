@@ -26,6 +26,75 @@ final class DatabaseViewModelCloudSyncTests: XCTestCase {
         try await super.tearDown()
     }
 
+    func testOldCloudOpenResolutionCannotOverwriteAConfirmedRekeyOrResurrectRemoval() async throws {
+        let bytes = try KDBXTestFixture.test.data(in: Bundle(for: Self.self))
+        for removeAfterRekey in [false, true] {
+            let reference = try makeStoredManualReference(fileID: "/late-open-\(removeAfterRekey).kdbx", autoFillEnabled: false)
+            try DatabaseListStore.cacheDatabaseCopy(bytes, for: reference)
+            let entered = XCTestExpectation(description: "Old resolution captured")
+            let completed = XCTestExpectation(description: "Old unlock fully returned")
+            let release = AsyncStream<Void>.makeStream()
+            let effects = CloudJournalEffectCounter()
+            let vm = DatabaseViewModel(databaseReference: reference, cloudSyncOperation: { reference, _ in
+                let resolution = try await CloudSyncCoordinator.syncIfNeededForOpen(reference: reference, providerResolver: { _ in nil })
+                entered.fulfill()
+                for await _ in release.stream { break }
+                return resolution
+            }, quickUnlockKeyPersistOperation: { _, _, _ in effects.record(); return true })
+            let opening = Task { await vm.unlock(password: KDBXTestFixture.test.password); completed.fulfill() }
+            let entry = await XCTWaiter.fulfillment(of: [entered], timeout: 30)
+            do {
+                XCTAssertEqual(entry, .completed)
+                let session = SymmetricKey(size: .bits256)
+                let parsed = try KDBXParser.parseWithMeta(data: bytes, password: fixturePassword, sessionKey: session)
+                let draft = DatabaseDraft(rootGroup: parsed.rootGroup, meta: parsed.meta, sessionKey: session)
+                let keyFile = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+                let keyFileBytes = Data(repeating: 0x42, count: 32)
+                try keyFileBytes.write(to: keyFile)
+                defer { try? FileManager.default.removeItem(at: keyFile) }
+                let bookmark = try SecurityScopedBookmarkManager.makeBookmarkData(for: keyFile, readOnly: true)
+                let change = PendingUploadQueue.KeyChange(keyFileBookmarkData: bookmark, keyFileFilename: "B.key")
+                let newKey = try KDBXCrypto.compositeKey(password: "confirmed-B", keyFileData: keyFileBytes)
+                let transport = CloudJournalTransport(remote: bytes, revision: "rev-A")
+                var environment = CloudDatabaseSaver.Environment.live
+                environment.beginBackgroundTask = { _ in .invalid }
+                environment.endBackgroundTask = { _ in }
+                environment.getMetadata = { _ in try transport.metadata(byteCount: bytes.count) }
+                environment.downloadRemoteData = { _ in bytes }
+                environment.upload = { _, bytes, rev, _ in try await transport.upload(bytes, revision: rev) }
+                let saver = environment
+                let result = try await CloudDatabaseSaver.$keyChange.withValue(change) {
+                    try await CloudDatabaseSaver.save(draft: draft, reference: reference,
+                        compositeKey: KDBXTestFixture.test.compositeKey(in: Bundle(for: Self.self)),
+                        openTimeSHA512: FileDigest.sha512(bytes), expectedRev: "rev-A", kdfPolicy: .mainApp,
+                        newCompositeKey: newKey, environment: saver)
+                }
+                guard case .saved = result else { throw SaveError.saveContextUnavailable }
+                let committed = try XCTUnwrap(DatabaseListStore.databases.first { $0.id == reference.id })
+                XCTAssertEqual(committed.cloudSyncMetadata?.keyEpoch, change.epoch)
+                XCTAssertEqual(committed.keyFileBookmarkData, bookmark)
+                XCTAssertNotNil(committed.lastMasterKeyChangeAt)
+                XCTAssertTrue(try PendingUploadQueue.readJournal(for: reference.id).isEmpty)
+                if removeAfterRekey { XCTAssertTrue(DatabaseListStore.remove(id: reference.id)) }
+                release.continuation.finish()
+                let joined = await XCTWaiter.fulfillment(of: [completed], timeout: 30)
+                if joined != .completed { fatalError("Old cloud unlock failed to join after releasing its only test gate") }
+                await opening.value
+                if removeAfterRekey { XCTAssertNil(DatabaseListStore.databases.first { $0.id == reference.id }) }
+                else { XCTAssertEqual(DatabaseListStore.databases.first { $0.id == reference.id }, committed) }
+                XCTAssertEqual(effects.value, 0)
+                vm.lock()
+            } catch {
+                release.continuation.finish()
+                let joined = await XCTWaiter.fulfillment(of: [completed], timeout: 30)
+                if joined != .completed { fatalError("Cloud open regression cannot clear stores beneath an unquiesced worker") }
+                await opening.value
+                vm.lock()
+                throw error
+            }
+        }
+    }
+
     func testOfflineKnownSaveCompletesSessionBookkeepingWithoutOptionalKeyPublicationOrRepeatedEncryption() async throws {
         let bytes = try KDBXTestFixture.test.data(in: Bundle(for: Self.self))
         let reference = try makeStoredManualReference(fileID: "/queued-save.kdbx", autoFillEnabled: false)
