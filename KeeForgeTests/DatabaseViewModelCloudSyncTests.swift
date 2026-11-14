@@ -41,7 +41,9 @@ final class DatabaseViewModelCloudSyncTests: XCTestCase {
 
     private func pendingMergeSetup(payload: Data? = nil, conflicted: Bool = true, sourceAfterUnlock: Bool = false,
         beforeSave: (@MainActor @Sendable (DatabaseReference) async throws -> Void)? = nil,
-        failFinalization: Bool = false, diagnostics: TestDatabaseSupport.LocalPublicationTrace = .init()) async throws -> PendingMergeSetup {
+        failFinalization: Bool = false, diagnostics: TestDatabaseSupport.LocalPublicationTrace = .init(),
+        configureSaver: @Sendable (inout CloudDatabaseSaver.Environment) -> Void = { _ in },
+        afterSaver: (@Sendable () async -> Void)? = nil) async throws -> PendingMergeSetup {
         let base = try fixtureData()
         let reference = try makeStoredManualReference(fileID: "/merge-\(UUID().uuidString).kdbx", autoFillEnabled: false)
         try DatabaseListStore.cacheDatabaseCopy(base, for: reference)
@@ -93,6 +95,9 @@ final class DatabaseViewModelCloudSyncTests: XCTestCase {
             do { let data = try read(url); diagnostics.recordObservation("saver-read.end"); return data }
             catch { diagnostics.record("saver-read", error); throw error }
         }
+        environment.queue.observedCommitLockFailure = { code in
+            diagnostics.recordObservation("commit-flock actualErrno=\(code)")
+        }
         environment.revisionIdentifiesContent = { _, _ in false }
         if failFinalization {
             let encode = environment.queue.encodeMarker
@@ -101,6 +106,7 @@ final class DatabaseViewModelCloudSyncTests: XCTestCase {
                 return try encode(marker)
             }
         }
+        configureSaver(&environment)
         let saver = environment
         let vm = DatabaseViewModel(databaseReference: reference,
             cloudSyncOperation: { reference, _ in
@@ -117,6 +123,7 @@ final class DatabaseViewModelCloudSyncTests: XCTestCase {
                         openTimeSHA512: sha, reconciledRemoteSHA512: remoteSHA, expectedRev: rev,
                         kdfPolicy: .mainApp, newCompositeKey: newKey, encryptionSettings: settings, environment: saver)
                     diagnostics.recordObservation("saver.return")
+                    await afterSaver?()
                     return result
                 } catch { diagnostics.record("saver", error); throw error }
             }, reloadOperation: { reference, key in
@@ -477,6 +484,122 @@ final class DatabaseViewModelCloudSyncTests: XCTestCase {
         XCTAssertEqual(try PendingUploadQueue.readJournal(for: setup.reference.id).count, 1)
     }
 
+    func testMergeNotificationDrainerCannotTakeLeaseBeforeOwnedHandoff() async throws {
+        try await exerciseNotificationHandoff(externalContention: false)
+    }
+
+    func testExternalDrainerLeaseStillRetainsSourcesWithoutSecondCryptoOrResend() async throws {
+        try await exerciseNotificationHandoff(externalContention: true)
+    }
+
+    private func exerciseNotificationHandoff(externalContention: Bool) async throws {
+        let base = try fixtureData()
+        let transport = CloudJournalTransport(remote: base, revision: "rev-A")
+        let leaseEntered = DispatchSemaphore(value: 0)
+        let releaseLease = DispatchSemaphore(value: 0)
+        let completed = XCTestExpectation(description: "real notification drain ended")
+        let cleanupCompleted = XCTestExpectation(description: "real drain cleanup ended")
+        let readCalls = CloudJournalEffectCounter()
+        let notifications = CloudJournalEffectCounter()
+        let trace = TestDatabaseSupport.LocalPublicationTrace()
+        var delivery = CloudDatabaseSaver.Environment.live
+        delivery.getMetadata = { _ in try transport.metadata(byteCount: base.count) }
+        delivery.downloadRemoteData = { _ in transport.download(fallback: base) }
+        delivery.upload = { _, bytes, rev, _ in try await transport.upload(bytes, revision: rev) }
+        delivery.revisionIdentifiesContent = { _, _ in false }
+        let read = delivery.queue.readData
+        delivery.queue.readData = { url in
+            readCalls.record()
+            if readCalls.value == 1 {
+                leaseEntered.signal()
+                guard releaseLease.wait(timeout: .now() + 15) == .success else { throw WaitTimedOut() }
+            }
+            return try read(url)
+        }
+        let heldDelivery = delivery
+        var draining = PendingUploadDrainer.Environment.live
+        draining.beginBackgroundTask = { _ in .invalid }
+        draining.endBackgroundTask = { _ in }
+        draining.deliverMarker = { try await CloudDatabaseSaver.deliver($0, reference: $1, environment: heldDelivery) }
+        let drainer = PendingUploadDrainer(environment: draining)
+        let liveNotify = PendingUploadQueue.Environment.live.postDarwinNotification
+        let notifyAndHold: @Sendable () -> Void = {
+            liveNotify()
+            notifications.record()
+            XCTAssertEqual(leaseEntered.wait(timeout: .now() + 15), .success,
+                "The real drainer must enter its queue read while holding the actual commit lease")
+        }
+        let beforeHandoff: @Sendable () async -> Void = {
+            await Task.detached { notifyAndHold() }.value
+        }
+        let setup = try await pendingMergeSetup(diagnostics: trace, configureSaver: { environment in
+            environment.queue.postDarwinNotification = externalContention ? liveNotify : notifyAndHold
+        }, afterSaver: externalContention ? beforeHandoff : nil)
+        defer { setup.vm.lock() }
+        var drainStarted = false
+        drainer.startObserving {
+            guard !drainStarted,
+                  PendingUploadQueue.listMarkers(for: setup.reference.id).contains(where: { $0.id != setup.source.stored.id }) else { return }
+            drainStarted = true
+            Task { @MainActor in
+                _ = await drainer.drain(databaseId: setup.reference.id)
+                completed.fulfill()
+                cleanupCompleted.fulfill()
+            }
+        }
+        defer { drainer.stopObserving() }
+        var drainJoined = false
+        do {
+            if externalContention {
+                do { try await setup.vm.mergePendingUploads(); XCTFail("External preclaim contention must remain recovery") }
+                catch { XCTAssertTrue(error is SaveBookkeepingWarning, trace.failure(error, at: "expected-external-contention")) }
+                XCTAssertTrue(trace.summary.contains("cloud-merge-consume.commit-entry"), trace.summary)
+                XCTAssertTrue(trace.summary.contains("cloud-merge-consume.flock-errno"), trace.summary)
+                let journal = try PendingUploadQueue.readJournal(for: setup.reference.id)
+                XCTAssertEqual(journal.count, 2)
+                XCTAssertTrue(journal.contains(where: { $0.id == setup.source.stored.id }))
+                XCTAssertEqual(try PendingUploadQueue.readImmutablePayload(setup.source.stored), setup.source.payload)
+                let output = try XCTUnwrap(journal.first { $0.id != setup.source.stored.id })
+                XCTAssertEqual(try PendingUploadQueue.readImmutablePayload(output), try Data(contentsOf: setup.source.cacheURL))
+            } else {
+                try await setup.vm.mergePendingUploads()
+                _ = try mergedJournal(setup, titles: ["AutoFill Entry"])
+                XCTAssertFalse(PendingUploadQueue.listMarkers(for: setup.reference.id).contains { $0.id == setup.source.stored.id })
+            }
+            XCTAssertEqual(notifications.value, 1)
+            XCTAssertEqual(setup.encryptions.value, 1)
+            XCTAssertEqual(setup.replacements.value, 1)
+            XCTAssertEqual(transport.effects.uploads.count, 0, "Provider dispatch cannot run through the held lease")
+            releaseLease.signal()
+            let joined = await XCTWaiter.fulfillment(of: [completed], timeout: 30)
+            guard joined == .completed else { throw WaitTimedOut() }
+            drainJoined = true
+            XCTAssertEqual(setup.encryptions.value, 1)
+            XCTAssertEqual(setup.replacements.value, 1)
+            if externalContention {
+                XCTAssertEqual(transport.effects.uploads.count, 0)
+                XCTAssertEqual(try PendingUploadQueue.readJournal(for: setup.reference.id).count, 2)
+            } else {
+                XCTAssertEqual(transport.effects.uploads.count, 1)
+                XCTAssertEqual(transport.effects.uploads.first?.bytes, try Data(contentsOf: setup.source.cacheURL))
+                XCTAssertTrue(try PendingUploadQueue.readJournal(for: setup.reference.id).isEmpty)
+            }
+        } catch {
+            let diagnostic = trace.failure(error, at: "notification-handoff")
+            setup.vm.lock()
+            releaseLease.signal()
+            if !drainJoined {
+                let joined = await XCTWaiter.fulfillment(of: [cleanupCompleted], timeout: 30)
+                guard joined == .completed else {
+                    XCTFail(diagnostic + "; real drain did not join after all gates released")
+                    fatalError("Unquiesced notification drain test cannot clear its store")
+                }
+            }
+            XCTFail(diagnostic)
+            throw error
+        }
+    }
+
     func testAuthenticatedMergeRejectsChangedSourcesTargetsAndReferenceBeforeEncryption() async throws {
         for fault in ["source-bytes", "new-source", "provisional", "unknown-schema", "missing-source", "same-inode-bytes", "new-inode", "factors", "epoch", "revoked"] {
             let setup = try await pendingMergeSetup(sourceAfterUnlock: true, beforeSave: { reference in
@@ -788,6 +911,9 @@ final class DatabaseViewModelCloudSyncTests: XCTestCase {
                 uploads.record(); diagnostics.recordObservation("upload count=\(uploads.value)")
                 return try remote.store(data, expectedRev: rev)
             }
+            environment.queue.observedCommitLockFailure = { code in
+                diagnostics.recordObservation("commit-flock actualErrno=\(code)")
+            }
             environment.revisionIdentifiesContent = { _, _ in false }
             let saver = environment
             let vm = DatabaseViewModel(databaseReference: reference,
@@ -799,9 +925,11 @@ final class DatabaseViewModelCloudSyncTests: XCTestCase {
                 }, localPublicationFailure: { diagnostics.record($0, $1) },
             cloudSaveOperation: { draft, reference, key, sha, remoteSHA, rev, newKey, settings in
                     diagnostics.recordObservation("saver.enter")
-                return try await CloudDatabaseSaver.save(draft: draft, reference: reference, compositeKey: key,
+                let result = try await CloudDatabaseSaver.save(draft: draft, reference: reference, compositeKey: key,
                         openTimeSHA512: sha, reconciledRemoteSHA512: remoteSHA, expectedRev: rev, kdfPolicy: .mainApp,
                         newCompositeKey: newKey, encryptionSettings: settings, environment: saver)
+                diagnostics.recordObservation("saver.return")
+                return result
                 }, reloadOperation: { reference, key in
                     try await DatabaseViewModel.reloadDatabase(reference: reference, compositeKey: key, providerResolver: { _ in remote })
                 }, quickUnlockKeyPersistOperation: { _, _, _ in false },

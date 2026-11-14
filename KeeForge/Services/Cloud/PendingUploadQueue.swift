@@ -226,6 +226,7 @@ enum PendingUploadQueue {
         var decodeMarker: @Sendable (Data) throws -> Marker
         var writeMarkerAtomically: @Sendable (Data, URL) throws -> Void
         var postDarwinNotification: @Sendable () -> Void
+        var observedCommitLockFailure: @Sendable (Int32) -> Void = { _ in }
 
         static let live = Environment(
             appGroupContainerURL: { AppGroupContainer.url },
@@ -561,7 +562,9 @@ enum PendingUploadQueue {
 
     /// Caller holds commit and reference authority through the exact source handoff.
     static func transferMergedSourcesLocked(_ sources: [StoredMarker], toPayloadSHA512 sha: Data,
-        reference current: DatabaseReference, environment: Environment = .live) throws {
+        reference current: DatabaseReference, environment: Environment = .live,
+        onStage: (String) -> Void = { _ in }) throws {
+        onStage("transfer-owner-proof")
         let databaseID = current.id
         guard var owner = try readJournal(for: databaseID, environment: environment).last(where: {
             $0.marker.isPayloadFinalized == true && $0.marker.intendedPayloadSHA512 == sha && $0.marker.intendedPayloadPath != nil
@@ -583,9 +586,11 @@ enum PendingUploadQueue {
                 throw SaveError.saveContextUnavailable
             }
         }
+        onStage("transfer-update")
         owner.marker.absorbedOperationIDs = Array(Set((owner.marker.absorbedOperationIDs ?? []) + sources.map(\.id)))
         owner = try update(owner, environment: environment)
         for source in sources where source.id != owner.id {
+            onStage("transfer-drop-sync")
             guard try dropIfUnchanged(source, environment: environment) else { throw SaveError.saveContextUnavailable }
         }
     }
@@ -598,7 +603,11 @@ enum PendingUploadQueue {
         let fd = Darwin.open(lockURL.path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
         guard fd >= 0 else { throw POSIXError(.EIO) }
         defer { Darwin.close(fd) }
-        guard flock(fd, nonBlocking ? LOCK_EX | LOCK_NB : LOCK_EX) == 0 else { throw POSIXError(.EWOULDBLOCK) }
+        guard flock(fd, nonBlocking ? LOCK_EX | LOCK_NB : LOCK_EX) == 0 else {
+            let failureErrno = errno
+            environment.observedCommitLockFailure(failureErrno)
+            throw POSIXError(.EWOULDBLOCK)
+        }
         defer { flock(fd, LOCK_UN) }
         return try body()
     }

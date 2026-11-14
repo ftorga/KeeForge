@@ -3538,7 +3538,8 @@ final class DatabaseViewModel {
                   cloudKeyAction == nil || keyCommitPublicationActionID == cloudKeyAction else { return }
             }
             if let mergeContext, !saveResult.hasUnconfirmedDurability {
-                try await Task.detached { try mergeContext.consume(sha512: newSHA512) }.value
+                let failure = localPublicationFailure
+                try await Task.detached { try mergeContext.consume(sha512: newSHA512, onFailure: failure) }.value
             }
             refreshDatabaseReference()
             populateCredentialStoreIfNeeded(root: mergedDraft.rootGroup)
@@ -3666,12 +3667,13 @@ final class DatabaseViewModel {
         switch saveResult {
         case .saved(let newSHA512, let expressKey, _),
              .committedWithoutConfirmedDurability(let newSHA512, let expressKey, _, _):
+            let failure = localPublicationFailure
             let transferred = await Task.detached(priority: .userInitiated) {
                 do {
                     guard !saveResult.hasUnconfirmedDurability else { return false }
-                    try context.consume(sha512: newSHA512)
+                    try context.consume(sha512: newSHA512, onFailure: failure)
                     return true
-                } catch { return false }
+                } catch { failure("cloud-merge-handoff", error); return false }
             }.value
             guard expectedLockCycleID == lockCycleID,
                   cloudKeyAction == nil || keyCommitPublicationActionID == cloudKeyAction else { return }

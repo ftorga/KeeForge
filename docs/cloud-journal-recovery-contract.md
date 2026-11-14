@@ -28,6 +28,8 @@ An open session Z can reconcile an AutoFill source/cache A with remote B without
 
 A metadata CAS mismatch during cloud open, Sync Now or automatic foreground refresh never imports the current epoch, factors or head into an older authenticated snapshot. The old snapshot may remain readable with its historical tuple, while its final key-publication fence rejects changed authority or removal. An independent fresh authentication of a restored file after full settlement keeps the ordinary product semantics.
 
+A merge queues its enqueue notification in the same RAM operation context and emits it only after handoff has exited all coordination/list/commit/owner locks; final action cleanup emits it if handoff was skipped. The callback is consumed once, without a persisted notification state. Ordinary-save notification timing is unchanged. This prevents that notification from waking a drainer into its own not-yet-completed handoff; independent lease contention still rejects the preclaim operation and retains sources, and no retry or reencryption is inferred from it.
+
 Local uncertainty, removal tombstones, admission and source-epoch fences remain intact. No permanent target pin or antirollback guarantee is added after settlement. A freshly authenticated restored file retains the ordinary product semantics.
 
 ## Create-only ownership
