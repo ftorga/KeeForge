@@ -71,6 +71,8 @@ jobs:
               DatabaseViewModelCloudSyncTests/testMergePendingUploadsTransfersTheAutoFillChangeToDurableOwnerThenDelivers
               DatabaseViewModelCloudSyncTests/testMergePendingUploadsWhenTheCloudCopyChangedAgainKeepsTheMarker
               DatabaseViewModelCloudSyncTests/testOrdinaryConflictReadsRemoteWithoutOverwritingPendingCacheThenExplicitMergeDeliversAndSavesAgain
+              DatabaseViewModelCloudSyncTests/testMergeNotificationDrainerCannotTakeLeaseBeforeOwnedHandoff
+              DatabaseViewModelCloudSyncTests/testExternalDrainerLeaseStillRetainsSourcesWithoutSecondCryptoOrResend
               DatabaseViewModelCloudSyncTests/testOldCloudOpenResolutionCannotOverwriteAConfirmedRekeyOrResurrectRemoval
             )
             if [[ "$TEST_SUITE" = KeeForgeTests ]]; then
