@@ -1,6 +1,11 @@
 import Foundation
 import KDBXKit
 
+struct CloudPendingMergeRequired: Error, LocalizedError {
+    let remoteData: Data
+    var errorDescription: String? { String(localized: "Merge the pending changes before reloading this cloud database.") }
+}
+
 struct CloudSyncResolution: Sendable {
     enum Status: Equatable, Sendable {
         case current
@@ -18,6 +23,7 @@ struct CloudSyncResolution: Sendable {
     let localURL: URL
     let data: Data
     let status: Status
+    var pendingUploadSources: [PendingUploadQueue.StoredMarker] = []
 
     /// Shared with tests so banner assertions stay locale-agnostic.
     static let offlineCachedBannerMessage = String(localized: "Using the cached copy offline.")
@@ -94,7 +100,7 @@ enum CloudSyncCoordinator {
         }
         guard let metadata = reference.cloudSyncMetadata else { throw CocoaError(.fileReadUnsupportedScheme) }
         var updatedReference = reference
-        if !pending.isEmpty {
+        if !pending.isEmpty && honorsManualSyncPolicy {
             guard cacheExists else { throw SaveError.saveContextUnavailable }
             return CloudSyncResolution(reference: reference, localURL: cacheURL,
                 data: try CoordinatedFileReader.readData(from: cacheURL), status: .refreshSkipped)
@@ -127,6 +133,20 @@ enum CloudSyncCoordinator {
                 status: .disconnectedCached,
                 error: CloudProviderError.notAuthenticated
             )
+        }
+
+        if !pending.isEmpty {
+            let snapshot = try await CloudDatabaseSaver.downloadRemoteSnapshot(provider: provider, metadata: metadata, progress: progress)
+            updatedReference.updateCloudSyncMetadata { learned in
+                if let observed = snapshot.metadata {
+                    learned.remoteContentHash = observed.contentHash
+                    learned.remoteModifiedAt = observed.modifiedDate
+                    learned.remoteRev = observed.rev
+                }
+                learned.lastSyncedAt = nil
+            }
+            return CloudSyncResolution(reference: updatedReference, localURL: cacheURL, data: snapshot.data,
+                status: .downloaded, pendingUploadSources: pending)
         }
 
         do {

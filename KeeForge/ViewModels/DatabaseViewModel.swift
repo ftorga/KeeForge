@@ -3435,14 +3435,32 @@ final class DatabaseViewModel {
             isSaving = false
         }
 
+        let mergedCloudSources: [PendingUploadQueue.StoredMarker]
+        if databaseReference.isCloudBacked {
+            let id = databaseReference.id
+            mergedCloudSources = try await Task.detached { try PendingUploadQueue.readJournal(for: id) }.value
+            guard CloudJournalDecision.permitsMutation(mergedCloudSources.map(\.marker), changingKey: false),
+                  !mergedCloudSources.contains(where: { $0.marker.confirmedAt != nil }) else { throw CloudSaveRecoveryWarning() }
+        } else { mergedCloudSources = [] }
+
         let merged: KDBXMerger.Merged
         do {
+            var root = localDraft.rootGroup
+            var meta = localDraft.meta
+            for source in mergedCloudSources {
+                let sourceBytes = try await Task.detached { try PendingUploadQueue.readImmutablePayload(source) }.value
+                let included = try await Self.mergeRemoteOffMain(remoteData: sourceBytes, compositeKey: compositeKey,
+                    sessionKey: sessionKey, localRootGroup: root, localMeta: meta,
+                    localBinaryPoolFields: localBinaryPoolFields ?? [])
+                root = included.rootGroup
+                meta = included.meta
+            }
             merged = try await Self.mergeRemoteOffMain(
                 remoteData: conflict.remoteData,
                 compositeKey: compositeKey,
                 sessionKey: sessionKey,
-                localRootGroup: localDraft.rootGroup,
-                localMeta: localDraft.meta,
+                localRootGroup: root,
+                localMeta: meta,
                 localBinaryPoolFields: localBinaryPoolFields ?? []
             )
         } catch let failure as DatabaseMergeFailure {
@@ -3510,6 +3528,12 @@ final class DatabaseViewModel {
                 try await publishCloudExpressKeyAfterSave(expressKey, sha512: newSHA512, actionID: cloudKeyAction)
                 guard expectedLockCycleID == lockCycleID,
                   cloudKeyAction == nil || keyCommitPublicationActionID == cloudKeyAction else { return }
+            }
+            if !mergedCloudSources.isEmpty, !saveResult.hasUnconfirmedDurability {
+                let id = databaseReference.id
+                try await Task.detached {
+                    try PendingUploadQueue.transferMergedSources(mergedCloudSources, toPayloadSHA512: newSHA512, for: id)
+                }.value
             }
             refreshDatabaseReference()
             populateCredentialStoreIfNeeded(root: mergedDraft.rootGroup)
@@ -3630,6 +3654,16 @@ final class DatabaseViewModel {
         guard expectedLockCycleID == lockCycleID,
                   cloudKeyAction == nil || keyCommitPublicationActionID == cloudKeyAction else { return }
 
+        let remoteResolution = try await cloudRefreshOperation(reference) { _ in }
+        guard Self.reachedCloud(remoteResolution.status) else { throw CloudProviderError.networkUnavailable }
+        guard expectedLockCycleID == lockCycleID, keyCommitPublicationActionID == cloudKeyAction else { return }
+        let remote = try await Self.mergeRemoteOffMain(remoteData: remoteResolution.data,
+            compositeKey: compositeKey, sessionKey: sessionKey, localRootGroup: mergedRootGroup,
+            localMeta: mergedMeta, localBinaryPoolFields: localBinaryPoolFields ?? [])
+        mergedRootGroup = remote.rootGroup
+        mergedMeta = remote.meta
+        let remoteSHA512 = FileDigest.sha512(remoteResolution.data)
+
         let mergedDraft = DatabaseDraft(
             rootGroup: mergedRootGroup,
             meta: mergedMeta,
@@ -3644,7 +3678,7 @@ final class DatabaseViewModel {
             reference,
             compositeKey,
             openTimeSHA512,
-            nil,
+            remoteSHA512,
             reference.expectedCloudRevision,
             nil,
             nil
@@ -3657,6 +3691,7 @@ final class DatabaseViewModel {
             let mergedReferenceID = databaseReference.id
             let transferred = await Task.detached(priority: .userInitiated) {
                 do {
+                    guard !saveResult.hasUnconfirmedDurability else { return false }
                     try PendingUploadQueue.transferMergedSources(resolvedMarkers, toPayloadSHA512: newSHA512, for: mergedReferenceID)
                     return true
                 } catch { return false }
@@ -4025,6 +4060,12 @@ final class DatabaseViewModel {
         let reloaded: ReloadedDatabase
         do {
             reloaded = try await reloadOperation(databaseReference, compositeKey)
+        } catch let pending as CloudPendingMergeRequired {
+            guard lockCycleID == expectedLockCycleID else { return }
+            isReplacingOpenDatabase = false
+            state = .unlocked
+            saveConflict = SaveConflict(remoteSHA512: FileDigest.sha512(pending.remoteData), remoteData: pending.remoteData)
+            throw pending
         } catch {
             guard lockCycleID == expectedLockCycleID else { return }
             isReplacingOpenDatabase = false
@@ -4146,7 +4187,7 @@ final class DatabaseViewModel {
 
         // Same metadata-only merge as the foreground refresh: a save that
         // landed during the round-trip must not be rolled back.
-        if let observedCloudMetadata,
+        if resolution.pendingUploadSources.isEmpty, let observedCloudMetadata,
            let learned = resolution.reference.cloudSyncMetadata,
            let mergedReference = DatabaseListStore.updateCloudSyncMetadata(
                for: resolution.reference.id,
@@ -4172,6 +4213,16 @@ final class DatabaseViewModel {
 
         guard FileDigest.sha512(resolution.data) != openTimeSHA512 else {
             cloudSyncOutcome = .upToDate
+            return
+        }
+
+        if !resolution.pendingUploadSources.isEmpty {
+            guard CloudJournalDecision.permitsMutation(resolution.pendingUploadSources.map(\.marker), changingKey: false) else {
+                cloudSyncOutcome = .failed(CloudSaveRecoveryWarning().localizedDescription)
+                return
+            }
+            saveConflict = SaveConflict(remoteSHA512: FileDigest.sha512(resolution.data), remoteData: resolution.data)
+            cloudSyncOutcome = .updateWaitsForSave
             return
         }
 
@@ -5300,7 +5351,8 @@ final class DatabaseViewModel {
             hasPendingCloudUploads = pendingUploadMarkerCheck(resolution.reference)
             unlockStatusMessage = Self.decryptingStatusMessage
             let mergedReference = await Task.detached { () -> DatabaseReference? in
-                guard let observed = observedReference.cloudSyncMetadata,
+                guard resolution.pendingUploadSources.isEmpty,
+                      let observed = observedReference.cloudSyncMetadata,
                       let learned = resolution.reference.cloudSyncMetadata else { return nil }
                 return DatabaseListStore.updateCloudSyncMetadata(for: observedReference.id, ifUnchangedFrom: observed) {
                     $0.remoteContentHash = learned.remoteContentHash
@@ -5582,9 +5634,14 @@ final class DatabaseViewModel {
         return siblingPath.hasPrefix("/") ? siblingPath : "/\(siblingPath)"
     }
 
+    static func reloadDatabase(reference: DatabaseReference, compositeKey: SymmetricKey) async throws -> ReloadedDatabase {
+        try await reloadDatabase(reference: reference, compositeKey: compositeKey, providerResolver: CloudProviderRegistry.provider(for:))
+    }
+
     static func reloadDatabase(
         reference: DatabaseReference,
-        compositeKey: SymmetricKey
+        compositeKey: SymmetricKey,
+        providerResolver: @Sendable (String) -> CloudProvider?
     ) async throws -> ReloadedDatabase {
         let data: Data
         let updatedReference: DatabaseReference
@@ -5596,8 +5653,10 @@ final class DatabaseViewModel {
             // cache and conflicts again.
             let resolution = try await CloudSyncCoordinator.syncIfNeededForOpen(
                 reference: reference,
-                honorsManualSyncPolicy: false
+                honorsManualSyncPolicy: false,
+                providerResolver: providerResolver
             )
+            if !resolution.pendingUploadSources.isEmpty { throw CloudPendingMergeRequired(remoteData: resolution.data) }
             data = resolution.data
             updatedReference = resolution.reference
             cloudSyncStatus = resolution.status

@@ -91,3 +91,5 @@
 - SDK transport tests use a real client with a unique intercepted host. Only read operations retry; write failure retains its actual journal attempt even when a response was lost or a conflict was returned.
 
 - A conflicted confirmed delivery remains owned by confirmation recovery; discard cannot retire it. Only verified local reconciliation may durably retire its journal and payload.
+
+- Explicit sync/reload can read a remote snapshot while retaining the pending cache and immutable sources. Resolution carries captured source identities in RAM only; it is not installed-cache or key-publication authority. A merge records the exact remote byte baseline and consumes only captured unchanged sources after durable output. Modern missing/corrupt payloads block mutation while valid cached reads remain available.

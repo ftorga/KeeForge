@@ -706,16 +706,23 @@ enum CloudDatabaseSaver {
         provider: CloudProvider,
         metadata: CloudSyncMetadata
     ) async throws -> Data {
+        try await downloadRemoteSnapshot(provider: provider, metadata: metadata).data
+    }
+
+    static func downloadRemoteSnapshot(
+        provider: CloudProvider, metadata: CloudSyncMetadata,
+        progress: @escaping @Sendable (Double) -> Void = { _ in }
+    ) async throws -> (data: Data, metadata: CloudFileMetadata?) {
         let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: false)
         defer {
             try? FileManager.default.removeItem(at: tempURL)
         }
 
-        try await provider.download(
+        let observed = try await provider.download(
             accountId: metadata.accountId,
             fileId: metadata.fileId,
             to: tempURL,
-            progress: { _ in }
+            progress: progress
         )
         #if os(iOS)
         // iOS Data Protection; every other on-disk copy of database bytes gets
@@ -727,6 +734,6 @@ enum CloudDatabaseSaver {
             ofItemAtPath: tempURL.path
         )
         #endif
-        return try Data(contentsOf: tempURL)
+        return (try Data(contentsOf: tempURL), observed)
     }
 }

@@ -38,7 +38,7 @@ Name the owner before changing a workflow. Views render, collect input, and forw
 
 - Stage edits through `DatabaseDraft` plus `save()`. Never mutate `rootGroup` and rebuild save state afterwards.
 - `mergeAndSave()` gates its write on the conflict's `remoteSHA512` (the bytes it merged), not `openTimeSHA512`. Every failure leaves the draft and the conflict standing.
-- `mergePendingUploads()` drops upload markers only after `.saved`; `.changeUnidentified` must never suggest Discard.
+- Pending-cloud merge includes an explicit remote snapshot and all captured source ciphertexts. Only a durable output can transfer exact unchanged sources into its journal; unknown attempts and confirmed journals keep their own recovery authority. `.changeUnidentified` must never suggest Discard.
 - Rekey and re-encryption refuse a dirty draft, an in-flight save, and cloud references with pending upload markers (draining them afterwards reverts the remote). The rekey stamps `lastMasterKeyChangeAt` so the drainer refuses older markers.
 - `save()` no-ops behind an in-flight save. An operation holding `isSaving` (rekey, re-encryption) flushes edits that landed behind it only after confirmed completion; a committed/unknown warning retains them for an explicit operation; `importEntries` refuses to start.
 - `syncCloudNow()` never discards unsaved work, never applies a response older than a save that finished mid-sync, never swaps a YubiKey session, and never pushes pending uploads.
@@ -121,3 +121,5 @@ Unit classes in `../../KeeForgeTests/` are named `<Type>Tests`. Cover success, f
 - A known cloud cache save completes its originating session and included-edit bookkeeping while journal delivery is queued. Optional express-key refresh defers until strict journal ownership is empty; the publication fence is never relaxed for pending work.
 
 - Cloud open completion merges only learned sync fields against the exact pre-await observed metadata. It never writes a captured whole reference over a later rekey, local head or removal, and a rejected metadata CAS supplies no current-epoch authority to the old parsed ciphertext.
+
+- Explicit cloud reads with pending journals do not publish the remote snapshot or learned validators into the pending cache/reference. Sync Now exposes divergence to Merge; Reload retains the draft and requests that merge first. A remote byte baseline does not inherit the prior reference’s validators.

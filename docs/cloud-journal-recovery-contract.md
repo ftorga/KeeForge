@@ -20,6 +20,10 @@ Before replacing a cloud cache, retain immutable intended ciphertext and a durab
 
 Valid cached bytes remain readable when recovery fails. Mutation uses strict journal enumeration, including unknown schema/IO failures. Sync-down cannot overwrite a pending cache. Cache publication rechecks captured epoch/date and local revocation; Keychain publication also checks the exact parsed/committed ciphertext. Coordination precedes immediate try-list/try-commit acquisition on the reverse-lock path; contention releases resources instead of waiting. Keychain-only effects cannot reenter the registry. Legacy reference cleanup runs after release.
 
+A confirmed journal cannot be discarded, including a conflicted record whose local reconciliation failed. Only confirmation recovery can retire it after durable target/reference/ancestry proof. A missing modern immutable payload fails mutation closed; it never supplies an empty owner observation.
+
+An explicit sync/reload with pending work downloads a read-only remote snapshot, leaving the cache and source namespaces intact. Sync Now offers divergent bytes to the existing merge action. Reload retains the draft and asks for that merge before replacing it. Merge authenticates the remote and captured source snapshots, writes against the exact reconciled remote SHA, and conditionally transfers only those unchanged source identities after a durable local output; confirmed/unknown work retains its own owner. A reconciled byte baseline does not inherit validators associated with the prior reference, so delivery verifies remote bytes before conditional dispatch. Optional express-key effects defer while any journal owns delivery; normal originating-session edit bookkeeping still completes for a known durable queued save.
+
 Local uncertainty, removal tombstones, admission and source-epoch fences remain intact. No permanent target pin or antirollback guarantee is added after settlement. A freshly authenticated restored file retains the ordinary product semantics.
 
 ## Create-only ownership

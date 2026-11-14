@@ -564,14 +564,28 @@ enum PendingUploadQueue {
             guard var owner = try readJournal(for: databaseID, environment: environment).last(where: {
                 $0.marker.isPayloadFinalized == true && $0.marker.intendedPayloadSHA512 == sha && $0.marker.intendedPayloadPath != nil
             }) else { return }
-            guard let path = owner.marker.intendedPayloadPath,
+            guard let current = DatabaseListStore.databases.first(where: { $0.id == databaseID }),
+                  current.cloudSyncMetadata?.localHeadOperationID == owner.id,
+                  current.cloudSyncMetadata?.keyEpoch == owner.marker.keyEpoch,
+                  owner.marker.localCommitBaseline?.hasCompatibleEpoch(current) == true,
+                  FileDigest.sha512(try environment.readData(DatabaseListStore.cacheLocation(for: current))) == sha,
+                  let path = owner.marker.intendedPayloadPath,
                   FileDigest.sha512(try environment.readData(resolveAppGroupURL(for: path, environment: environment))) == sha else {
                 throw SaveError.saveContextUnavailable
             }
+            let journal = try readJournal(for: databaseID, environment: environment)
+            for source in sources where source.id != owner.id {
+                guard source.marker.confirmedAt == nil,
+                      source.marker.uploadAttemptID == nil || source.marker.attemptIsFenced == true,
+                      journal.contains(where: { $0.id == source.id && $0.marker == source.marker }),
+                      FileDigest.sha512(try readImmutablePayload(source, environment: environment)) == source.marker.intendedPayloadSHA512 else {
+                    throw SaveError.saveContextUnavailable
+                }
+            }
             owner.marker.absorbedOperationIDs = Array(Set((owner.marker.absorbedOperationIDs ?? []) + sources.map(\.id)))
             owner = try update(owner, environment: environment)
-            for source in sources where source.id != owner.id && (source.marker.uploadAttemptID == nil || source.marker.attemptIsFenced == true || source.marker.confirmedAt != nil) {
-                _ = try dropIfUnchanged(source, environment: environment)
+            for source in sources where source.id != owner.id {
+                guard try dropIfUnchanged(source, environment: environment) else { throw SaveError.saveContextUnavailable }
             }
         }
     }
@@ -639,6 +653,11 @@ enum PendingUploadQueue {
         marker.predecessorSHA512 = currentSHA
         marker.predecessorOperationID = predecessor?.id
         marker.remoteBaseSHA512 = remoteBaseSHA512 ?? predecessor?.marker.remoteBaseSHA512 ?? (predecessor == nil ? currentSHA : nil)
+        if remoteBaseSHA512 != nil {
+            // A reconciled byte baseline is not evidence binding the prior reference's remote validators.
+            marker.expectedRev = nil
+            marker.baseRev = nil
+        }
         marker.intendedPayloadSHA512 = FileDigest.sha512(intendedData)
         marker.intendedPayloadPath = try makeRelativeAppGroupPath(for: payloadURL, environment: environment)
         marker.keyEpoch = keyChange?.epoch ?? reference.cloudSyncMetadata?.keyEpoch

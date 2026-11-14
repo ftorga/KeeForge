@@ -37124,6 +37124,64 @@
         }
       }
     },
+    "Merge the pending changes before reloading this cloud database." : {
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Führe die ausstehenden Änderungen zusammen, bevor du diese Cloud-Datenbank neu lädst."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Merge the pending changes before reloading this cloud database."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Combina los cambios pendientes antes de volver a cargar esta base de datos en la nube."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Fusionnez les modifications en attente avant de recharger cette base de données cloud."
+          }
+        },
+        "it" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Unisci le modifiche in sospeso prima di ricaricare questo database nel cloud."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "このクラウドデータベースを再読み込みする前に、保留中の変更をマージしてください。"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Объедините ожидающие изменения перед повторной загрузкой этой облачной базы данных."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "重新加载此云数据库之前，请先合并待处理的更改。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "重新載入此雲端資料庫之前，請先合併待處理的變更。"
+          }
+        }
+      }
+    },
     "Message" : {
       "localizations" : {
         "de" : {
