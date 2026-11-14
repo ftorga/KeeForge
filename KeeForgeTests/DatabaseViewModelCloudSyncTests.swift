@@ -36,11 +36,12 @@ final class DatabaseViewModelCloudSyncTests: XCTestCase {
         let encryptions: CloudJournalEffectCounter
         let replacements: CloudJournalEffectCounter
         let keyEffects: CloudJournalEffectCounter
+        let diagnostics: TestDatabaseSupport.LocalPublicationTrace
     }
 
     private func pendingMergeSetup(payload: Data? = nil, conflicted: Bool = true, sourceAfterUnlock: Bool = false,
         beforeSave: (@MainActor @Sendable (DatabaseReference) async throws -> Void)? = nil,
-        failFinalization: Bool = false) async throws -> PendingMergeSetup {
+        failFinalization: Bool = false, diagnostics: TestDatabaseSupport.LocalPublicationTrace = .init()) async throws -> PendingMergeSetup {
         let base = try fixtureData()
         let reference = try makeStoredManualReference(fileID: "/merge-\(UUID().uuidString).kdbx", autoFillEnabled: false)
         try DatabaseListStore.cacheDatabaseCopy(base, for: reference)
@@ -53,15 +54,45 @@ final class DatabaseViewModelCloudSyncTests: XCTestCase {
         environment.endBackgroundTask = { _ in }
         let encrypt = environment.encryptDraft
         environment.encryptDraft = { draft, key, header, policy in
-            encryptions.record(); return try encrypt(draft, key, header, policy)
+            encryptions.record()
+            diagnostics.recordObservation("encrypt.begin count=\(encryptions.value)")
+            let result = try encrypt(draft, key, header, policy)
+            diagnostics.recordObservation("encrypt.end")
+            return result
         }
         let replace = environment.replaceFile
         environment.replaceFile = { data, url, sha, ref in
-            replacements.record(); return try replace(data, url, sha, ref)
+            replacements.record()
+            diagnostics.recordObservation("replacement.begin count=\(replacements.value)")
+            do {
+                let result = try replace(data, url, sha, ref)
+                diagnostics.recordObservation("replacement.end")
+                return result
+            } catch { diagnostics.record("replacement", error); throw error }
         }
-        environment.getMetadata = { _ in remote.currentMetadata }
-        environment.downloadRemoteData = { _ in remote.currentBytes }
-        environment.upload = { _, bytes, rev, _ in try remote.store(bytes, expectedRev: rev) }
+        let metadataCalls = CloudJournalEffectCounter()
+        let downloadCalls = CloudJournalEffectCounter()
+        let uploadCalls = CloudJournalEffectCounter()
+        environment.getMetadata = { _ in
+            metadataCalls.record(); diagnostics.recordObservation("metadata count=\(metadataCalls.value)")
+            return remote.currentMetadata
+        }
+        environment.downloadRemoteData = { _ in
+            downloadCalls.record(); diagnostics.recordObservation("download count=\(downloadCalls.value)")
+            return remote.currentBytes
+        }
+        environment.upload = { _, bytes, rev, _ in
+            uploadCalls.record(); diagnostics.recordObservation("upload.begin count=\(uploadCalls.value)")
+            let result = try remote.store(bytes, expectedRev: rev)
+            diagnostics.recordObservation("upload.end")
+            return result
+        }
+        let read = environment.readData
+        environment.readData = { url in
+            diagnostics.recordObservation("saver-read.begin")
+            do { let data = try read(url); diagnostics.recordObservation("saver-read.end"); return data }
+            catch { diagnostics.record("saver-read", error); throw error }
+        }
         environment.revisionIdentifiesContent = { _, _ in false }
         if failFinalization {
             let encode = environment.queue.encodeMarker
@@ -77,23 +108,39 @@ final class DatabaseViewModelCloudSyncTests: XCTestCase {
             }, cloudRefreshOperation: { reference, _ in
                 try await CloudSyncCoordinator.syncIfNeededForOpen(reference: reference,
                     honorsManualSyncPolicy: false, providerResolver: { _ in remote })
-            }, cloudSaveOperation: { draft, reference, key, sha, remoteSHA, rev, newKey, settings in
+            }, localPublicationFailure: { diagnostics.record($0, $1) },
+            cloudSaveOperation: { draft, reference, key, sha, remoteSHA, rev, newKey, settings in
                 try await beforeSave?(reference)
-                return try await CloudDatabaseSaver.save(draft: draft, reference: reference, compositeKey: key,
-                    openTimeSHA512: sha, reconciledRemoteSHA512: remoteSHA, expectedRev: rev,
-                    kdfPolicy: .mainApp, newCompositeKey: newKey, encryptionSettings: settings, environment: saver)
+                diagnostics.recordObservation("saver.enter")
+                do {
+                    let result = try await CloudDatabaseSaver.save(draft: draft, reference: reference, compositeKey: key,
+                        openTimeSHA512: sha, reconciledRemoteSHA512: remoteSHA, expectedRev: rev,
+                        kdfPolicy: .mainApp, newCompositeKey: newKey, encryptionSettings: settings, environment: saver)
+                    diagnostics.recordObservation("saver.return")
+                    return result
+                } catch { diagnostics.record("saver", error); throw error }
             }, reloadOperation: { reference, key in
                 try await DatabaseViewModel.reloadDatabase(reference: reference, compositeKey: key, providerResolver: { _ in remote })
             }, quickUnlockKeyPersistOperation: { _, _, _ in false },
             expressUnlockKeySaveOperation: { _, _ in keyEffects.record() })
+        diagnostics.recordObservation("setup-unlock-source.begin")
+        do {
         if sourceAfterUnlock { await vm.unlock(password: fixturePassword) }
         let source = try CloudJournalTestContext(reference: reference, base: base,
             payload: payload ?? mergeVariant(title: "AutoFill Entry"))
         if conflicted { _ = try PendingUploadQueue.markConflicted(source.stored) }
         if !sourceAfterUnlock { await vm.unlock(password: fixturePassword) }
         XCTAssertEqual(vm.state, .unlocked)
+        let cache = try Data(contentsOf: source.cacheURL)
+        diagnostics.recordObservation("setup-source generation=\(source.stored.marker.generation) cacheMatches=\(cache == source.payload) headMatches=\(DatabaseListStore.databases.first { $0.id == reference.id }?.cloudSyncMetadata?.localHeadOperationID == source.stored.id)")
         return .init(vm: vm, reference: reference, base: base, source: source, remote: remote, saver: saver,
-            encryptions: encryptions, replacements: replacements, keyEffects: keyEffects)
+            encryptions: encryptions, replacements: replacements, keyEffects: keyEffects, diagnostics: diagnostics)
+        } catch {
+            let diagnostic = diagnostics.failure(error, at: "setup-unlock-source")
+            XCTFail(diagnostic)
+            vm.lock()
+            throw error
+        }
     }
 
     private func mergeVariant(title: String, pool: [Data]? = nil, attachment: Bool = false) throws -> Data {
@@ -116,8 +163,11 @@ final class DatabaseViewModelCloudSyncTests: XCTestCase {
         let merged = try XCTUnwrap(journal.first)
         XCTAssertEqual(journal.count, 1)
         XCTAssertNotEqual(merged.id, setup.source.stored.id)
+        setup.diagnostics.recordObservation("journal-proof.begin generation=\(merged.marker.generation)")
         let bytes = try PendingUploadQueue.readImmutablePayload(merged)
-        XCTAssertEqual(bytes, try Data(contentsOf: setup.source.cacheURL))
+        let cache = try Data(contentsOf: setup.source.cacheURL)
+        setup.diagnostics.recordObservation("journal-proof cacheMatches=\(bytes == cache) headMatches=\(DatabaseListStore.databases.first { $0.id == setup.reference.id }?.cloudSyncMetadata?.localHeadOperationID == merged.id)")
+        XCTAssertEqual(bytes, cache)
         XCTAssertEqual(FileDigest.sha512(bytes), setup.vm.openTimeSHA512)
         XCTAssertTrue(try Self.entryTitles(in: bytes, password: fixturePassword).isSuperset(of: titles))
         XCTAssertFalse(setup.vm.hasPendingUploadConflict)
@@ -126,23 +176,39 @@ final class DatabaseViewModelCloudSyncTests: XCTestCase {
     }
 
     func testMergePendingUploadsTransfersTheAutoFillChangeToDurableOwnerThenDelivers() async throws {
-        let setup = try await pendingMergeSetup()
-        defer { setup.vm.lock() }
-        let opened = entryTitles(in: setup.vm)
-        XCTAssertTrue(setup.vm.hasPendingUploadConflict)
-        try await setup.vm.mergePendingUploads()
-        let merged = try mergedJournal(setup, titles: opened.union(["AutoFill Entry"]))
-        XCTAssertEqual(setup.remote.currentBytes, setup.base, "A local commit queues delivery; it is not an upload")
-        XCTAssertNotNil(setup.vm.mergeSummaryMessage)
-        guard case .saved? = try await CloudDatabaseSaver.deliver(merged, reference: setup.vm.databaseReference, environment: setup.saver) else {
-            return XCTFail("The durable merged owner must deliver")
+        let diagnostics = TestDatabaseSupport.LocalPublicationTrace()
+        var phase = "setup.before"
+        var cleanupVM: DatabaseViewModel?
+        defer { cleanupVM?.lock() }
+        do {
+            phase = "setup.before"
+            let setup = try await pendingMergeSetup(diagnostics: diagnostics)
+            cleanupVM = setup.vm
+            let opened = entryTitles(in: setup.vm)
+            XCTAssertTrue(setup.vm.hasPendingUploadConflict)
+            phase = "merge-pending.before"
+            try await setup.vm.mergePendingUploads()
+            phase = "merge-pending.after"
+            phase = "journal-proof.before"
+            let merged = try mergedJournal(setup, titles: opened.union(["AutoFill Entry"]))
+            XCTAssertEqual(setup.remote.currentBytes, setup.base, "A local commit queues delivery; it is not an upload")
+            XCTAssertNotNil(setup.vm.mergeSummaryMessage)
+            phase = "deliver.before"
+            guard case .saved? = try await CloudDatabaseSaver.deliver(merged, reference: setup.vm.databaseReference, environment: setup.saver) else {
+                return XCTFail("The durable merged owner must deliver")
+            }
+            XCTAssertTrue(try PendingUploadQueue.readJournal(for: setup.reference.id).isEmpty)
+            XCTAssertEqual(try Self.entryTitles(in: setup.remote.currentBytes, password: fixturePassword),
+                try Self.entryTitles(in: Data(contentsOf: setup.source.cacheURL), password: fixturePassword))
+            XCTAssertEqual(setup.encryptions.value, 1)
+            XCTAssertEqual(setup.replacements.value, 1)
+            XCTAssertEqual(setup.keyEffects.value, 0)
+        } catch {
+            diagnostics.recordObservation("errorType=\(String(reflecting: type(of: error)))")
+            let diagnostic = diagnostics.failure(error, at: phase)
+            XCTFail(diagnostic)
+            throw error
         }
-        XCTAssertTrue(try PendingUploadQueue.readJournal(for: setup.reference.id).isEmpty)
-        XCTAssertEqual(try Self.entryTitles(in: setup.remote.currentBytes, password: fixturePassword),
-            try Self.entryTitles(in: Data(contentsOf: setup.source.cacheURL), password: fixturePassword))
-        XCTAssertEqual(setup.encryptions.value, 1)
-        XCTAssertEqual(setup.replacements.value, 1)
-        XCTAssertEqual(setup.keyEffects.value, 0)
     }
 
     func testMergePendingUploadsKeepsUnsavedEditsInTheUpload() async throws {
@@ -171,37 +237,75 @@ final class DatabaseViewModelCloudSyncTests: XCTestCase {
     }
 
     func testMergePendingUploadsWhenTheCloudCopyChangedAgainKeepsTheMarker() async throws {
-        let setup = try await pendingMergeSetup()
-        defer { setup.vm.lock() }
-        try await setup.vm.mergePendingUploads()
-        let merged = try mergedJournal(setup, titles: ["AutoFill Entry"])
-        _ = try setup.remote.store(mergeVariant(title: "Later Remote"), expectedRev: nil)
-        guard case .conflict? = try await CloudDatabaseSaver.deliver(merged, reference: setup.vm.databaseReference, environment: setup.saver) else {
-            return XCTFail("Remote divergence must conflict without dispatch")
+        let diagnostics = TestDatabaseSupport.LocalPublicationTrace()
+        var phase = "setup.before"
+        var cleanupVM: DatabaseViewModel?
+        defer { cleanupVM?.lock() }
+        do {
+            phase = "setup.before"
+            let setup = try await pendingMergeSetup(diagnostics: diagnostics)
+            cleanupVM = setup.vm
+            phase = "merge-pending.before"
+            try await setup.vm.mergePendingUploads()
+            phase = "merge-pending.after"
+            phase = "journal-proof.before"
+            let merged = try mergedJournal(setup, titles: ["AutoFill Entry"])
+            phase = "remote-change.before"
+            _ = try setup.remote.store(mergeVariant(title: "Later Remote"), expectedRev: nil)
+            phase = "deliver.before"
+            guard case .conflict? = try await CloudDatabaseSaver.deliver(merged, reference: setup.vm.databaseReference, environment: setup.saver) else {
+                return XCTFail("Remote divergence must conflict without dispatch")
+            }
+            XCTAssertEqual(try PendingUploadQueue.readImmutablePayload(merged), try Data(contentsOf: setup.source.cacheURL))
+            XCTAssertEqual(try PendingUploadQueue.readJournal(for: setup.reference.id).count, 1)
+            XCTAssertFalse(try Self.entryTitles(in: setup.remote.currentBytes, password: fixturePassword).contains("AutoFill Entry"))
+        } catch {
+            diagnostics.recordObservation("errorType=\(String(reflecting: type(of: error)))")
+            let diagnostic = diagnostics.failure(error, at: phase)
+            XCTFail(diagnostic)
+            throw error
         }
-        XCTAssertEqual(try PendingUploadQueue.readImmutablePayload(merged), try Data(contentsOf: setup.source.cacheURL))
-        XCTAssertEqual(try PendingUploadQueue.readJournal(for: setup.reference.id).count, 1)
-        XCTAssertFalse(try Self.entryTitles(in: setup.remote.currentBytes, password: fixturePassword).contains("AutoFill Entry"))
     }
 
     func testMergePendingUploadsThatHitANewerCloudCopySucceedsAfterSyncNow() async throws {
-        let setup = try await pendingMergeSetup()
-        defer { setup.vm.lock() }
-        try await setup.vm.mergePendingUploads()
-        let first = try mergedJournal(setup, titles: ["AutoFill Entry"])
-        _ = try setup.remote.store(mergeVariant(title: "Newer Cloud Entry"), expectedRev: nil)
-        guard case .conflict? = try await CloudDatabaseSaver.deliver(first, reference: setup.vm.databaseReference, environment: setup.saver) else {
-            return XCTFail("A new remote edit must be detected")
+        let diagnostics = TestDatabaseSupport.LocalPublicationTrace()
+        var phase = "setup.before"
+        var cleanupVM: DatabaseViewModel?
+        defer { cleanupVM?.lock() }
+        do {
+            phase = "setup.before"
+            let setup = try await pendingMergeSetup(diagnostics: diagnostics)
+            cleanupVM = setup.vm
+            phase = "merge-pending.before"
+            try await setup.vm.mergePendingUploads()
+            phase = "merge-pending.after"
+            phase = "journal-proof.before"
+            let first = try mergedJournal(setup, titles: ["AutoFill Entry"])
+            phase = "remote-change.before"
+            _ = try setup.remote.store(mergeVariant(title: "Newer Cloud Entry"), expectedRev: nil)
+            phase = "deliver.before"
+            guard case .conflict? = try await CloudDatabaseSaver.deliver(first, reference: setup.vm.databaseReference, environment: setup.saver) else {
+                return XCTFail("A new remote edit must be detected")
+            }
+            await setup.vm.syncCloudNow()
+            XCTAssertEqual(setup.vm.saveConflict?.remoteData, setup.remote.currentBytes)
+            phase = "merge-conflict.before"
+            try await setup.vm.mergeAndSave()
+            phase = "merge-conflict.after"
+            phase = "journal-proof.before"
+            let second = try mergedJournal(setup, titles: ["AutoFill Entry", "Newer Cloud Entry"])
+            XCTAssertNotEqual(first.id, second.id)
+            phase = "deliver.before"
+            guard case .saved? = try await CloudDatabaseSaver.deliver(second, reference: setup.vm.databaseReference, environment: setup.saver) else {
+                return XCTFail("Explicitly merging the newer remote must resolve the conflict")
+            }
+            XCTAssertTrue(try PendingUploadQueue.readJournal(for: setup.reference.id).isEmpty)
+        } catch {
+            diagnostics.recordObservation("errorType=\(String(reflecting: type(of: error)))")
+            let diagnostic = diagnostics.failure(error, at: phase)
+            XCTFail(diagnostic)
+            throw error
         }
-        await setup.vm.syncCloudNow()
-        XCTAssertEqual(setup.vm.saveConflict?.remoteData, setup.remote.currentBytes)
-        try await setup.vm.mergeAndSave()
-        let second = try mergedJournal(setup, titles: ["AutoFill Entry", "Newer Cloud Entry"])
-        XCTAssertNotEqual(first.id, second.id)
-        guard case .saved? = try await CloudDatabaseSaver.deliver(second, reference: setup.vm.databaseReference, environment: setup.saver) else {
-            return XCTFail("Explicitly merging the newer remote must resolve the conflict")
-        }
-        XCTAssertTrue(try PendingUploadQueue.readJournal(for: setup.reference.id).isEmpty)
     }
 
     func testMergePendingUploadsWhoseUploadFailsKeepsTheMarker() async throws {
@@ -290,18 +394,35 @@ final class DatabaseViewModelCloudSyncTests: XCTestCase {
     }
 
     func testAnOrdinarySaveRetainsTheConflictedSourceUntilExplicitOwnedMerge() async throws {
-        let setup = try await pendingMergeSetup()
-        defer { setup.vm.lock() }
-        // A fresh read of A may save on A; it does not prove that an old conflict was reconciled.
-        setup.vm.lock()
-        await setup.vm.unlock(password: fixturePassword)
-        try setup.vm.applyEntryEdit(.createEntry(parentGroupID: XCTUnwrap(setup.vm.visibleRootGroupID),
-            draft: EntryDraftPayload(title: "Ordinary Edit", password: "local")))
-        try await setup.vm.save()
-        XCTAssertTrue(try PendingUploadQueue.readJournal(for: setup.reference.id).contains(where: { $0.id == setup.source.stored.id }))
-        XCTAssertTrue(setup.vm.hasPendingUploadConflict)
-        try await setup.vm.mergePendingUploads()
-        _ = try mergedJournal(setup, titles: ["AutoFill Entry", "Ordinary Edit"])
+        let diagnostics = TestDatabaseSupport.LocalPublicationTrace()
+        var phase = "setup.before"
+        var cleanupVM: DatabaseViewModel?
+        defer { cleanupVM?.lock() }
+        do {
+            phase = "setup.before"
+            let setup = try await pendingMergeSetup(diagnostics: diagnostics)
+            cleanupVM = setup.vm
+            // A fresh read of A may save on A; it does not prove that an old conflict was reconciled.
+            setup.vm.lock()
+            await setup.vm.unlock(password: fixturePassword)
+            try setup.vm.applyEntryEdit(.createEntry(parentGroupID: XCTUnwrap(setup.vm.visibleRootGroupID),
+                draft: EntryDraftPayload(title: "Ordinary Edit", password: "local")))
+            phase = "save.before"
+            try await setup.vm.save()
+            phase = "save.after"
+            XCTAssertTrue(try PendingUploadQueue.readJournal(for: setup.reference.id).contains(where: { $0.id == setup.source.stored.id }))
+            XCTAssertTrue(setup.vm.hasPendingUploadConflict)
+            phase = "merge-pending.before"
+            try await setup.vm.mergePendingUploads()
+            phase = "merge-pending.after"
+            phase = "journal-proof.before"
+            _ = try mergedJournal(setup, titles: ["AutoFill Entry", "Ordinary Edit"])
+        } catch {
+            diagnostics.recordObservation("errorType=\(String(reflecting: type(of: error)))")
+            let diagnostic = diagnostics.failure(error, at: phase)
+            XCTFail(diagnostic)
+            throw error
+        }
     }
 
     func testPendingUploadConflictIsNotOfferedForAReadOnlyDatabase() async throws {
@@ -510,65 +631,88 @@ final class DatabaseViewModelCloudSyncTests: XCTestCase {
     }
 
     func testCapturedMergeCannotWriteAfterAnotherWindowSettlesThenRekeysOrRemoves() async throws {
-        for remove in [false, true] {
-            let setup = try await pendingMergeSetup()
-            defer { setup.vm.lock() }
-            let key = try KDBXTestFixture.test.compositeKey(in: Bundle(for: Self.self))
-            let session = SymmetricKey(size: .bits256)
-            let parsed = try KDBXParser.parseWithMetaAndHeader(data: setup.base, compositeKey: key, sessionKey: session)
-            let draft = DatabaseDraft(rootGroup: parsed.rootGroup, meta: parsed.meta, sessionKey: session,
-                binaryPoolFields: parsed.header.innerHeaderBinaryFields)
-            let before = setup.vm.databaseReference
-            let sources = try PendingUploadQueue.readJournal(for: before.id)
-            let remote = CloudSyncResolution(reference: before, localURL: setup.source.cacheURL, data: setup.base, status: .current)
-            let authenticated = try await DatabaseViewModel.CloudMergeAuthentication.merging(reference: before,
-                sources: sources, remote: remote, draft: draft, compositeKey: key, sessionKey: session)
-            let old = try await Task.detached { try CloudDatabaseSaver.MergeContext.capture(authenticated.1) }.value
-            defer { old.finish() }
-            let mergedDraft = DatabaseDraft(rootGroup: authenticated.0.rootGroup, meta: authenticated.0.meta,
-                sessionKey: session, binaryPoolFields: draft.binaryPoolFields)
-            // A different invocation settles A before the captured invocation resumes.
-            try await setup.vm.mergePendingUploads()
-            let owner = try mergedJournal(setup, titles: ["AutoFill Entry"])
-            guard case .saved? = try await CloudDatabaseSaver.deliver(owner, reference: setup.vm.databaseReference, environment: setup.saver) else {
-                return XCTFail("Settlement must precede rekey/removal")
-            }
-            let current = try XCTUnwrap(DatabaseListStore.databases.first(where: { $0.id == before.id }))
-            let expected: Data?
-            if remove {
-                XCTAssertTrue(DatabaseListStore.remove(id: before.id))
-                expected = nil
-            } else {
-                let bytes = try Data(contentsOf: setup.source.cacheURL)
-                let opened = try KDBXParser.parseWithMetaAndHeader(data: bytes, compositeKey: key, sessionKey: session)
-                let clean = DatabaseDraft(rootGroup: opened.rootGroup, meta: opened.meta, sessionKey: session,
-                    binaryPoolFields: opened.header.innerHeaderBinaryFields)
-                let nextKey = try KDBXCrypto.compositeKey(password: "epoch B", keyFileData: nil)
-                let result = try await CloudDatabaseSaver.save(draft: clean, reference: current, compositeKey: key,
-                    openTimeSHA512: FileDigest.sha512(bytes), expectedRev: current.expectedCloudRevision, kdfPolicy: .mainApp, newCompositeKey: nextKey,
-                    keyChange: .init(keyFileBookmarkData: nil, keyFileFilename: nil), environment: setup.saver)
-                guard case .saved = result else { return XCTFail("B must actually commit") }
-                expected = try Data(contentsOf: setup.source.cacheURL)
-                _ = try KDBXParser.parseWithMeta(data: XCTUnwrap(expected), password: "epoch B", sessionKey: SymmetricKey(size: .bits256))
-                XCTAssertNotEqual(DatabaseListStore.databases.first(where: { $0.id == before.id })?.cloudSyncMetadata?.keyEpoch,
-                    before.cloudSyncMetadata?.keyEpoch)
-            }
-            let encryptionCount = setup.encryptions.value
-            let replacementCount = setup.replacements.value
-            do {
-                _ = try await CloudDatabaseSaver.$mergeContext.withValue(old) {
-                    try await CloudDatabaseSaver.save(draft: mergedDraft, reference: before, compositeKey: key,
-                        openTimeSHA512: FileDigest.sha512(setup.base), reconciledRemoteSHA512: FileDigest.sha512(setup.base),
-                        expectedRev: nil, kdfPolicy: .mainApp, environment: setup.saver)
+        let diagnostics = TestDatabaseSupport.LocalPublicationTrace()
+        var phase = "setup.before"
+        var cleanupVM: DatabaseViewModel?
+        defer { cleanupVM?.lock() }
+        do {
+            for remove in [false, true] {
+                phase = "setup.before"
+                let setup = try await pendingMergeSetup(diagnostics: diagnostics)
+                cleanupVM = setup.vm
+                let key = try KDBXTestFixture.test.compositeKey(in: Bundle(for: Self.self))
+                let session = SymmetricKey(size: .bits256)
+                phase = "reparse.before"
+                let parsed = try KDBXParser.parseWithMetaAndHeader(data: setup.base, compositeKey: key, sessionKey: session)
+                let draft = DatabaseDraft(rootGroup: parsed.rootGroup, meta: parsed.meta, sessionKey: session,
+                    binaryPoolFields: parsed.header.innerHeaderBinaryFields)
+                let before = setup.vm.databaseReference
+                let sources = try PendingUploadQueue.readJournal(for: before.id)
+                let remote = CloudSyncResolution(reference: before, localURL: setup.source.cacheURL, data: setup.base, status: .current)
+                let authenticated = try await DatabaseViewModel.CloudMergeAuthentication.merging(reference: before,
+                    sources: sources, remote: remote, draft: draft, compositeKey: key, sessionKey: session)
+                phase = "capture-context.before"
+                let old = try await Task.detached { try CloudDatabaseSaver.MergeContext.capture(authenticated.1) }.value
+                defer { old.finish() }
+                let mergedDraft = DatabaseDraft(rootGroup: authenticated.0.rootGroup, meta: authenticated.0.meta,
+                    sessionKey: session, binaryPoolFields: draft.binaryPoolFields)
+                // A different invocation settles A before the captured invocation resumes.
+                phase = "merge-pending.before"
+                try await setup.vm.mergePendingUploads()
+                phase = "merge-pending.after"
+                phase = "journal-proof.before"
+                let owner = try mergedJournal(setup, titles: ["AutoFill Entry"])
+                phase = "deliver.before"
+                guard case .saved? = try await CloudDatabaseSaver.deliver(owner, reference: setup.vm.databaseReference, environment: setup.saver) else {
+                    return XCTFail("Settlement must precede rekey/removal")
                 }
-                XCTFail("Stale captured ownership cannot authorize a write")
-            } catch { XCTAssertFalse(error is CloudSaveRecoveryWarning) }
-            XCTAssertEqual(setup.encryptions.value, encryptionCount)
-            XCTAssertEqual(setup.replacements.value, replacementCount)
-            XCTAssertEqual(setup.keyEffects.value, 0)
-            XCTAssertEqual(try? Data(contentsOf: setup.source.cacheURL), expected)
-            XCTAssertTrue(try PendingUploadQueue.readJournal(for: before.id).isEmpty)
-            if remove { XCTAssertFalse(DatabaseListStore.databases.contains(where: { $0.id == before.id })) }
+                let current = try XCTUnwrap(DatabaseListStore.databases.first(where: { $0.id == before.id }))
+                let expected: Data?
+                if remove {
+                    XCTAssertTrue(DatabaseListStore.remove(id: before.id))
+                    expected = nil
+                } else {
+                    let bytes = try Data(contentsOf: setup.source.cacheURL)
+                    phase = "reparse.before"
+                    let opened = try KDBXParser.parseWithMetaAndHeader(data: bytes, compositeKey: key, sessionKey: session)
+                    let clean = DatabaseDraft(rootGroup: opened.rootGroup, meta: opened.meta, sessionKey: session,
+                        binaryPoolFields: opened.header.innerHeaderBinaryFields)
+                    let nextKey = try KDBXCrypto.compositeKey(password: "epoch B", keyFileData: nil)
+                    phase = "saver-or-rekey.before"
+                    let result = try await CloudDatabaseSaver.save(draft: clean, reference: current, compositeKey: key,
+                        openTimeSHA512: FileDigest.sha512(bytes), expectedRev: current.expectedCloudRevision, kdfPolicy: .mainApp, newCompositeKey: nextKey,
+                        keyChange: .init(keyFileBookmarkData: nil, keyFileFilename: nil), environment: setup.saver)
+                    guard case .saved = result else { return XCTFail("B must actually commit") }
+                    expected = try Data(contentsOf: setup.source.cacheURL)
+                    phase = "reparse.before"
+                    _ = try KDBXParser.parseWithMeta(data: XCTUnwrap(expected), password: "epoch B", sessionKey: SymmetricKey(size: .bits256))
+                    XCTAssertNotEqual(DatabaseListStore.databases.first(where: { $0.id == before.id })?.cloudSyncMetadata?.keyEpoch,
+                        before.cloudSyncMetadata?.keyEpoch)
+                }
+                let encryptionCount = setup.encryptions.value
+                let replacementCount = setup.replacements.value
+                do {
+                    _ = try await CloudDatabaseSaver.$mergeContext.withValue(old) {
+                        phase = "saver-or-rekey.before"
+                        try await CloudDatabaseSaver.save(draft: mergedDraft, reference: before, compositeKey: key,
+                            openTimeSHA512: FileDigest.sha512(setup.base), reconciledRemoteSHA512: FileDigest.sha512(setup.base),
+                            expectedRev: nil, kdfPolicy: .mainApp, environment: setup.saver)
+                    }
+                    XCTFail("Stale captured ownership cannot authorize a write")
+                } catch { XCTAssertFalse(error is CloudSaveRecoveryWarning) }
+                XCTAssertEqual(setup.encryptions.value, encryptionCount)
+                XCTAssertEqual(setup.replacements.value, replacementCount)
+                XCTAssertEqual(setup.keyEffects.value, 0)
+                XCTAssertEqual(try? Data(contentsOf: setup.source.cacheURL), expected)
+                XCTAssertTrue(try PendingUploadQueue.readJournal(for: before.id).isEmpty)
+                if remove { XCTAssertFalse(DatabaseListStore.databases.contains(where: { $0.id == before.id })) }
+                setup.vm.lock()
+            }
+        } catch {
+            diagnostics.recordObservation("errorType=\(String(reflecting: type(of: error)))")
+            let diagnostic = diagnostics.failure(error, at: phase)
+            XCTFail(diagnostic)
+            throw error
         }
     }
 
@@ -608,96 +752,129 @@ final class DatabaseViewModelCloudSyncTests: XCTestCase {
     }
 
     func testOrdinaryConflictReadsRemoteWithoutOverwritingPendingCacheThenExplicitMergeDeliversAndSavesAgain() async throws {
-        let base = try KDBXTestFixture.test.data(in: Bundle(for: Self.self))
-        let reference = try makeStoredManualReference(fileID: "/ordinary-merge.kdbx", autoFillEnabled: false)
-        try DatabaseListStore.cacheDatabaseCopy(base, for: reference)
-        let key = try KDBXTestFixture.test.compositeKey(in: Bundle(for: Self.self))
-        let remoteSession = SymmetricKey(size: .bits256)
-        let parsed = try KDBXParser.parseWithMetaAndHeader(data: base, compositeKey: key, sessionKey: remoteSession)
-        let remoteDraft = try DatabaseDraft(rootGroup: parsed.rootGroup, meta: parsed.meta,
-            sessionKey: remoteSession, binaryPoolFields: parsed.header.innerHeaderBinaryFields).apply(
-                .createEntry(parentGroupID: TestDatabaseSupport.visibleRootGroupID(in: parsed.rootGroup),
-                    draft: EntryDraftPayload(title: "Remote B", password: "B")))
-        let remoteB = try CloudDatabaseSaver.Environment.live.encryptDraft(remoteDraft, key, parsed.header, .mainApp).data
-        let remote = InMemoryRemoteProvider(bytes: base, rev: "rev-A")
-        let encryptions = CloudJournalEffectCounter()
-        let uploads = CloudJournalEffectCounter()
-        let keyEffects = CloudJournalEffectCounter()
-        var environment = CloudDatabaseSaver.Environment.live
-        environment.beginBackgroundTask = { _ in .invalid }
-        environment.endBackgroundTask = { _ in }
-        let encrypt = environment.encryptDraft
-        environment.encryptDraft = { draft, key, header, policy in encryptions.record(); return try encrypt(draft, key, header, policy) }
-        environment.getMetadata = { _ in remote.currentMetadata }
-        environment.downloadRemoteData = { _ in remote.currentBytes }
-        environment.upload = { _, data, rev, _ in uploads.record(); return try remote.store(data, expectedRev: rev) }
-        environment.revisionIdentifiesContent = { _, _ in false }
-        let saver = environment
-        let vm = DatabaseViewModel(databaseReference: reference,
-            cloudSyncOperation: { reference, _ in
-                try await CloudSyncCoordinator.syncIfNeededForOpen(reference: reference, providerResolver: { _ in remote })
-            }, cloudRefreshOperation: { reference, _ in
-                try await CloudSyncCoordinator.syncIfNeededForOpen(reference: reference, honorsManualSyncPolicy: false,
-                    providerResolver: { _ in remote })
-            }, cloudSaveOperation: { draft, reference, key, sha, remoteSHA, rev, newKey, settings in
-                try await CloudDatabaseSaver.save(draft: draft, reference: reference, compositeKey: key,
-                    openTimeSHA512: sha, reconciledRemoteSHA512: remoteSHA, expectedRev: rev, kdfPolicy: .mainApp,
-                    newCompositeKey: newKey, encryptionSettings: settings, environment: saver)
-            }, reloadOperation: { reference, key in
-                try await DatabaseViewModel.reloadDatabase(reference: reference, compositeKey: key, providerResolver: { _ in remote })
-            }, quickUnlockKeyPersistOperation: { _, _, _ in false },
-            expressUnlockKeySaveOperation: { _, _ in keyEffects.record() })
-        await vm.unlock(password: fixturePassword)
-        defer { vm.lock() }
-        try vm.applyEntryEdit(.createEntry(parentGroupID: XCTUnwrap(vm.visibleRootGroupID),
-            draft: EntryDraftPayload(title: "Local A", password: "A")))
-        try await vm.save()
-        let source = try XCTUnwrap(PendingUploadQueue.readJournal(for: reference.id).first)
-        let localA = try Data(contentsOf: DatabaseListStore.cacheLocation(for: reference))
-        _ = try remote.store(remoteB, expectedRev: nil)
-        guard case .conflict? = try await CloudDatabaseSaver.deliver(source, reference: reference, environment: saver) else {
-            return XCTFail("Remote B must conflict before any upload of local A")
+        let diagnostics = TestDatabaseSupport.LocalPublicationTrace()
+        var phase = "setup.before"
+        var cleanupVM: DatabaseViewModel?
+        defer { cleanupVM?.lock() }
+        do {
+            let base = try KDBXTestFixture.test.data(in: Bundle(for: Self.self))
+            let reference = try makeStoredManualReference(fileID: "/ordinary-merge.kdbx", autoFillEnabled: false)
+            try DatabaseListStore.cacheDatabaseCopy(base, for: reference)
+            let key = try KDBXTestFixture.test.compositeKey(in: Bundle(for: Self.self))
+            let remoteSession = SymmetricKey(size: .bits256)
+            phase = "reparse.before"
+            let parsed = try KDBXParser.parseWithMetaAndHeader(data: base, compositeKey: key, sessionKey: remoteSession)
+            let remoteDraft = try DatabaseDraft(rootGroup: parsed.rootGroup, meta: parsed.meta,
+                sessionKey: remoteSession, binaryPoolFields: parsed.header.innerHeaderBinaryFields).apply(
+                    .createEntry(parentGroupID: TestDatabaseSupport.visibleRootGroupID(in: parsed.rootGroup),
+                        draft: EntryDraftPayload(title: "Remote B", password: "B")))
+            let remoteB = try CloudDatabaseSaver.Environment.live.encryptDraft(remoteDraft, key, parsed.header, .mainApp).data
+            let remote = InMemoryRemoteProvider(bytes: base, rev: "rev-A")
+            let encryptions = CloudJournalEffectCounter()
+            let uploads = CloudJournalEffectCounter()
+            let keyEffects = CloudJournalEffectCounter()
+            var environment = CloudDatabaseSaver.Environment.live
+            environment.beginBackgroundTask = { _ in .invalid }
+            environment.endBackgroundTask = { _ in }
+            let encrypt = environment.encryptDraft
+            environment.encryptDraft = { draft, key, header, policy in
+                encryptions.record(); diagnostics.recordObservation("encrypt count=\(encryptions.value)")
+                return try encrypt(draft, key, header, policy)
+            }
+            environment.getMetadata = { _ in remote.currentMetadata }
+            environment.downloadRemoteData = { _ in remote.currentBytes }
+            phase = "remote-change.before"
+            environment.upload = { _, data, rev, _ in
+                uploads.record(); diagnostics.recordObservation("upload count=\(uploads.value)")
+                return try remote.store(data, expectedRev: rev)
+            }
+            environment.revisionIdentifiesContent = { _, _ in false }
+            let saver = environment
+            let vm = DatabaseViewModel(databaseReference: reference,
+                cloudSyncOperation: { reference, _ in
+                    try await CloudSyncCoordinator.syncIfNeededForOpen(reference: reference, providerResolver: { _ in remote })
+                }, cloudRefreshOperation: { reference, _ in
+                    try await CloudSyncCoordinator.syncIfNeededForOpen(reference: reference, honorsManualSyncPolicy: false,
+                        providerResolver: { _ in remote })
+                }, localPublicationFailure: { diagnostics.record($0, $1) },
+            cloudSaveOperation: { draft, reference, key, sha, remoteSHA, rev, newKey, settings in
+                    phase = "saver-or-rekey.before"
+                    diagnostics.recordObservation("saver.enter")
+                return try await CloudDatabaseSaver.save(draft: draft, reference: reference, compositeKey: key,
+                        openTimeSHA512: sha, reconciledRemoteSHA512: remoteSHA, expectedRev: rev, kdfPolicy: .mainApp,
+                        newCompositeKey: newKey, encryptionSettings: settings, environment: saver)
+                }, reloadOperation: { reference, key in
+                    try await DatabaseViewModel.reloadDatabase(reference: reference, compositeKey: key, providerResolver: { _ in remote })
+                }, quickUnlockKeyPersistOperation: { _, _, _ in false },
+                expressUnlockKeySaveOperation: { _, _ in keyEffects.record() })
+            await vm.unlock(password: fixturePassword)
+            cleanupVM = vm
+            try vm.applyEntryEdit(.createEntry(parentGroupID: XCTUnwrap(vm.visibleRootGroupID),
+                draft: EntryDraftPayload(title: "Local A", password: "A")))
+            phase = "save.before"
+            try await vm.save()
+            phase = "save.after"
+            let source = try XCTUnwrap(PendingUploadQueue.readJournal(for: reference.id).first)
+            let localA = try Data(contentsOf: DatabaseListStore.cacheLocation(for: reference))
+            phase = "remote-change.before"
+            _ = try remote.store(remoteB, expectedRev: nil)
+            phase = "deliver.before"
+            guard case .conflict? = try await CloudDatabaseSaver.deliver(source, reference: reference, environment: saver) else {
+                return XCTFail("Remote B must conflict before any upload of local A")
+            }
+            XCTAssertEqual(uploads.value, 0)
+            await vm.syncCloudNow()
+            XCTAssertEqual(vm.saveConflict?.remoteData, remoteB)
+            XCTAssertTrue(entryTitles(in: vm).contains("Local A"))
+            XCTAssertEqual(try Data(contentsOf: DatabaseListStore.cacheLocation(for: reference)), localA)
+            let captured = try XCTUnwrap(PendingUploadQueue.readJournal(for: reference.id).first)
+            XCTAssertEqual(try PendingUploadQueue.readImmutablePayload(captured), localA)
+            try vm.applyEntryEdit(.createEntry(parentGroupID: XCTUnwrap(vm.visibleRootGroupID),
+                draft: EntryDraftPayload(title: "Draft C", password: "C")))
+            do { try await vm.reloadDiscardingDraft(); XCTFail("Reload cannot overwrite unresolved pending ciphertext") }
+            catch { XCTAssertTrue(error is CloudPendingMergeRequired) }
+            XCTAssertTrue(vm.isDirty)
+            XCTAssertTrue(vm.currentRootGroup?.allEntries.contains { $0.title == "Draft C" } == true)
+            XCTAssertEqual(vm.saveConflict?.remoteData, remoteB)
+            phase = "merge-conflict.before"
+            try await vm.mergeAndSave()
+            phase = "merge-conflict.after"
+            XCTAssertNil(vm.saveConflict)
+            let merged = try XCTUnwrap(PendingUploadQueue.readJournal(for: reference.id).first)
+            XCTAssertNotEqual(merged.id, source.id)
+            XCTAssertEqual(try PendingUploadQueue.readJournal(for: reference.id).count, 1)
+            XCTAssertEqual(merged.marker.remoteBaseSHA512, FileDigest.sha512(remoteB))
+            XCTAssertNil(merged.marker.expectedRev)
+            phase = "deliver.before"
+            guard case .saved? = try await CloudDatabaseSaver.deliver(merged, reference: vm.databaseReference, environment: saver) else {
+                return XCTFail("The exact explicitly reconciled remote baseline must deliver once")
+            }
+            phase = "reparse.before"
+            let reopened = try KDBXParser.parseWithMeta(data: remote.currentBytes, password: fixturePassword, sessionKey: SymmetricKey(size: .bits256))
+            let titles = Set(reopened.rootGroup.allEntries.map(\.title))
+            XCTAssertTrue(titles.isSuperset(of: ["Local A", "Remote B", "Draft C"]))
+            XCTAssertTrue(try PendingUploadQueue.readJournal(for: reference.id).isEmpty)
+            XCTAssertEqual(uploads.value, 1)
+            XCTAssertEqual(encryptions.value, 2)
+            try vm.applyEntryEdit(.createEntry(parentGroupID: XCTUnwrap(vm.visibleRootGroupID),
+                draft: EntryDraftPayload(title: "Next D", password: "D")))
+            phase = "save.before"
+            try await vm.save()
+            phase = "save.after"
+            phase = "reparse.before"
+            let final = try KDBXParser.parseWithMeta(data: Data(contentsOf: DatabaseListStore.cacheLocation(for: reference)),
+                password: fixturePassword, sessionKey: SymmetricKey(size: .bits256))
+            XCTAssertTrue(Set(final.rootGroup.allEntries.map(\.title)).isSuperset(of: ["Local A", "Remote B", "Draft C", "Next D"]))
+            XCTAssertFalse(vm.isDirty)
+            XCTAssertEqual(encryptions.value, 3)
+            XCTAssertEqual(uploads.value, 1)
+            XCTAssertEqual(keyEffects.value, 0)
+        } catch {
+            diagnostics.recordObservation("errorType=\(String(reflecting: type(of: error)))")
+            let diagnostic = diagnostics.failure(error, at: phase)
+            XCTFail(diagnostic)
+            throw error
         }
-        XCTAssertEqual(uploads.value, 0)
-        await vm.syncCloudNow()
-        XCTAssertEqual(vm.saveConflict?.remoteData, remoteB)
-        XCTAssertTrue(entryTitles(in: vm).contains("Local A"))
-        XCTAssertEqual(try Data(contentsOf: DatabaseListStore.cacheLocation(for: reference)), localA)
-        let captured = try XCTUnwrap(PendingUploadQueue.readJournal(for: reference.id).first)
-        XCTAssertEqual(try PendingUploadQueue.readImmutablePayload(captured), localA)
-        try vm.applyEntryEdit(.createEntry(parentGroupID: XCTUnwrap(vm.visibleRootGroupID),
-            draft: EntryDraftPayload(title: "Draft C", password: "C")))
-        do { try await vm.reloadDiscardingDraft(); XCTFail("Reload cannot overwrite unresolved pending ciphertext") }
-        catch { XCTAssertTrue(error is CloudPendingMergeRequired) }
-        XCTAssertTrue(vm.isDirty)
-        XCTAssertTrue(vm.currentRootGroup?.allEntries.contains { $0.title == "Draft C" } == true)
-        XCTAssertEqual(vm.saveConflict?.remoteData, remoteB)
-        try await vm.mergeAndSave()
-        XCTAssertNil(vm.saveConflict)
-        let merged = try XCTUnwrap(PendingUploadQueue.readJournal(for: reference.id).first)
-        XCTAssertNotEqual(merged.id, source.id)
-        XCTAssertEqual(try PendingUploadQueue.readJournal(for: reference.id).count, 1)
-        XCTAssertEqual(merged.marker.remoteBaseSHA512, FileDigest.sha512(remoteB))
-        XCTAssertNil(merged.marker.expectedRev)
-        guard case .saved? = try await CloudDatabaseSaver.deliver(merged, reference: vm.databaseReference, environment: saver) else {
-            return XCTFail("The exact explicitly reconciled remote baseline must deliver once")
-        }
-        let reopened = try KDBXParser.parseWithMeta(data: remote.currentBytes, password: fixturePassword, sessionKey: SymmetricKey(size: .bits256))
-        let titles = Set(reopened.rootGroup.allEntries.map(\.title))
-        XCTAssertTrue(titles.isSuperset(of: ["Local A", "Remote B", "Draft C"]))
-        XCTAssertTrue(try PendingUploadQueue.readJournal(for: reference.id).isEmpty)
-        XCTAssertEqual(uploads.value, 1)
-        XCTAssertEqual(encryptions.value, 2)
-        try vm.applyEntryEdit(.createEntry(parentGroupID: XCTUnwrap(vm.visibleRootGroupID),
-            draft: EntryDraftPayload(title: "Next D", password: "D")))
-        try await vm.save()
-        let final = try KDBXParser.parseWithMeta(data: Data(contentsOf: DatabaseListStore.cacheLocation(for: reference)),
-            password: fixturePassword, sessionKey: SymmetricKey(size: .bits256))
-        XCTAssertTrue(Set(final.rootGroup.allEntries.map(\.title)).isSuperset(of: ["Local A", "Remote B", "Draft C", "Next D"]))
-        XCTAssertFalse(vm.isDirty)
-        XCTAssertEqual(encryptions.value, 3)
-        XCTAssertEqual(uploads.value, 1)
-        XCTAssertEqual(keyEffects.value, 0)
     }
 
     private func joinCloudRefresh(_ worker: Task<Void, Never>, vm: DatabaseViewModel) async throws {
