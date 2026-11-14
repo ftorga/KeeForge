@@ -98,9 +98,7 @@ final class DropboxCloudProvider: CloudProvider, @unchecked Sendable {
         var clients: [String: DropboxClient] = [:]
     }
 
-    /// A Dropbox failure the caller is expected to retry itself. `withRetry`
-    /// always either retries or rethrows `mapped`, so this never escapes the
-    /// provider; the `LocalizedError` conformance is a backstop.
+    /// Read retry policy unwraps these failures; writes return them without retrying an uncertain request.
     struct TransientFailure: Error, LocalizedError {
         enum Kind: Equatable {
             case rateLimited(retryAfter: UInt64)

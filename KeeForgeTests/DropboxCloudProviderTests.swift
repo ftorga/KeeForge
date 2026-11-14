@@ -216,8 +216,7 @@ final class DropboxCloudProviderTests: XCTestCase {
         XCTAssertEqual(failure?.mapped, .rateLimited)
     }
 
-    /// The transient wrapper is unwrapped by the retry loop, but if one ever
-    /// escaped it must still read as the localized rate-limit message.
+    /// Writes surface the transient cause without internally retrying it.
     func testTransientFailureCarriesLocalizedDescription() {
         let failure = DropboxCloudProvider.TransientFailure(kind: .tooManyWriteOperations, mapped: .rateLimited)
 
@@ -346,8 +345,11 @@ private final class DropboxHTTPProbe: @unchecked Sendable {
     }
 
     func client() -> DropboxClient {
-        DropboxClient(transportClient: DropboxTransportClientImpl(accessToken: "unit-transport-only",
-            baseHosts: BaseHosts(apiHost: host, contentHost: host, notifyHost: host)))
+        var configuration = NetworkSessionConfiguration(kind: .default)
+        configuration.timeoutIntervalForRequest = 5
+        configuration.timeoutIntervalForResource = 5
+        return DropboxClient(transportClient: DropboxTransportClientImpl(accessToken: "unit-transport-only",
+            baseHosts: BaseHosts(apiHost: host, contentHost: host, notifyHost: host), sessionConfiguration: configuration))
     }
 
     func close() { DropboxProbeURLProtocol.remove(host: host) }
