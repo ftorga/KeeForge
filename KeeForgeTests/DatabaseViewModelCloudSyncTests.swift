@@ -703,7 +703,10 @@ final class DatabaseViewModelCloudSyncTests: XCTestCase {
     func testOldCloudOpenResolutionCannotOverwriteAConfirmedRekeyOrResurrectRemoval() async throws {
         let bytes = try KDBXTestFixture.test.data(in: Bundle(for: Self.self))
         for removeAfterRekey in [false, true] {
-            let reference = try makeStoredManualReference(fileID: "/late-open-\(removeAfterRekey).kdbx", autoFillEnabled: false)
+            var reference = try makeStoredManualReference(fileID: "/late-open-\(removeAfterRekey).kdbx", autoFillEnabled: false)
+            reference.legacyKeychainFilename = "old-open-\(UUID().uuidString).kdbx"
+            DatabaseListStore.update(reference)
+            let capturedReference = reference
             try DatabaseListStore.cacheDatabaseCopy(bytes, for: reference)
             let entered = XCTestExpectation(description: "Old resolution captured")
             let completed = XCTestExpectation(description: "Old unlock fully returned")
@@ -718,7 +721,7 @@ final class DatabaseViewModelCloudSyncTests: XCTestCase {
             let opening = Task { await vm.unlock(password: KDBXTestFixture.test.password); completed.fulfill() }
             let entry = await XCTWaiter.fulfillment(of: [entered], timeout: 30)
             do {
-                XCTAssertEqual(entry, .completed)
+                guard entry == .completed else { XCTFail("Old open never reached its captured resolution"); throw WaitTimedOut() }
                 let session = SymmetricKey(size: .bits256)
                 let parsed = try KDBXParser.parseWithMeta(data: bytes, password: fixturePassword, sessionKey: session)
                 let draft = DatabaseDraft(rootGroup: parsed.rootGroup, meta: parsed.meta, sessionKey: session)
@@ -749,19 +752,61 @@ final class DatabaseViewModelCloudSyncTests: XCTestCase {
                 XCTAssertEqual(committed.keyFileBookmarkData, bookmark)
                 XCTAssertNotNil(committed.lastMasterKeyChangeAt)
                 XCTAssertTrue(try PendingUploadQueue.readJournal(for: reference.id).isEmpty)
+                let installedB = try Data(contentsOf: DatabaseListStore.cacheLocation(for: committed))
+                _ = try KDBXParser.parse(data: installedB, compositeKey: newKey, sessionKey: SymmetricKey(size: .bits256))
                 if removeAfterRekey { XCTAssertTrue(DatabaseListStore.remove(id: reference.id)) }
+                else {
+                    // Supported restoration after full settlement does not carry an old invocation's authority forward.
+                    try DatabaseListStore.cacheDatabaseCopy(bytes, for: committed)
+                    XCTAssertEqual(try Data(contentsOf: DatabaseListStore.cacheLocation(for: committed)), bytes)
+                }
                 release.continuation.finish()
                 let joined = await XCTWaiter.fulfillment(of: [completed], timeout: 30)
-                if joined != .completed { fatalError("Old cloud unlock failed to join after releasing its only test gate") }
+                if joined != .completed {
+                    XCTFail("Old cloud unlock did not complete after its only gate was released")
+                    fatalError("Old cloud unlock failed to join after releasing its only test gate")
+                }
                 await opening.value
                 if removeAfterRekey { XCTAssertNil(DatabaseListStore.databases.first { $0.id == reference.id }) }
                 else { XCTAssertEqual(DatabaseListStore.databases.first { $0.id == reference.id }, committed) }
                 XCTAssertEqual(effects.value, 0)
+                XCTAssertEqual(vm.databaseReference.cloudSyncMetadata?.keyEpoch, capturedReference.cloudSyncMetadata?.keyEpoch)
+                XCTAssertEqual(vm.databaseReference.keyFileBookmarkData, capturedReference.keyFileBookmarkData)
+                XCTAssertEqual(vm.databaseReference.lastMasterKeyChangeAt, capturedReference.lastMasterKeyChangeAt)
+                if !removeAfterRekey {
+                    XCTAssertEqual(vm.state, .unlocked, "The historically authenticated ciphertext may remain readable")
+                    XCTAssertEqual(vm.openTimeSHA512, FileDigest.sha512(bytes))
+                    XCTAssertEqual(DatabaseListStore.databases.first { $0.id == reference.id }?.legacyKeychainFilename,
+                        committed.legacyKeychainFilename, "Rejected publication must not run legacy registry cleanup")
+                    let freshEffects = CloudJournalEffectCounter()
+                    let fresh = DatabaseViewModel(databaseReference: committed, cloudSyncOperation: { ref, _ in
+                        try await CloudSyncCoordinator.syncIfNeededForOpen(reference: ref, providerResolver: { _ in nil })
+                    }, quickUnlockKeyPersistOperation: { _, ref, _ in
+                        XCTAssertEqual(ref.cloudSyncMetadata?.keyEpoch, change.epoch)
+                        freshEffects.record()
+                        return true
+                    })
+                    defer { fresh.lock() }
+                    await fresh.unlock(password: fixturePassword)
+                    XCTAssertEqual(fresh.state, .unlocked, "A new authenticated restore keeps main semantics after full settlement")
+                    XCTAssertEqual(fresh.openTimeSHA512, FileDigest.sha512(bytes))
+                    XCTAssertEqual(freshEffects.value, 1, "No permanent rollback pin is introduced")
+                    let afterFresh = try XCTUnwrap(DatabaseListStore.databases.first { $0.id == reference.id })
+                    XCTAssertEqual(afterFresh.cloudSyncMetadata, committed.cloudSyncMetadata)
+                    XCTAssertEqual(afterFresh.lastMasterKeyChangeAt, committed.lastMasterKeyChangeAt)
+                    XCTAssertEqual(afterFresh.keyFileBookmarkData, committed.keyFileBookmarkData)
+                    XCTAssertNil(afterFresh.legacyKeychainFilename, "Only the fresh admitted publication may clear legacy metadata")
+                }
                 vm.lock()
             } catch {
+                vm.lock()
+                opening.cancel()
                 release.continuation.finish()
                 let joined = await XCTWaiter.fulfillment(of: [completed], timeout: 30)
-                if joined != .completed { fatalError("Cloud open regression cannot clear stores beneath an unquiesced worker") }
+                if joined != .completed {
+                    XCTFail("Cloud open cleanup did not join the complete task after cancellation and gate release")
+                    fatalError("Cloud open regression cannot clear stores beneath an unquiesced worker")
+                }
                 await opening.value
                 vm.lock()
                 throw error

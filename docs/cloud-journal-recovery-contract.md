@@ -26,6 +26,8 @@ An explicit sync/reload with pending work downloads a read-only remote snapshot,
 
 An open session Z can reconcile an AutoFill source/cache A with remote B without treating either SHA as the other baseline. The real parser/merger authenticates all captured sources and B; a restricted, nonserialized single-invocation context binds the before-reference, exact cache A identity/SHA, source generations, local owner epoch and operation UUID. The saver revalidates that authority before encryption and under its final coordinated replacement fence. The remote B SHA is recorded separately and does not inherit old validators. A subsequent coordinated handoff checks the real durable installed output and the same exact source set before transferring ownership to the new journal. Concurrent sources, changed cache/reference/epoch, cancellation before claim or an unconfirmed output retain the old sources; the context cannot authorize a Keychain write, another invocation, or adoption of arbitrary current bytes. A claimed write may complete despite cancellation, so lack of a callback is never no-effect evidence.
 
+A cloud-open metadata CAS mismatch never imports the current epoch, factors or head into an older authenticated snapshot. The old snapshot may remain readable with its historical tuple, while its final key-publication fence rejects changed authority or removal. An independent fresh authentication of a restored file after full settlement keeps the ordinary product semantics.
+
 Local uncertainty, removal tombstones, admission and source-epoch fences remain intact. No permanent target pin or antirollback guarantee is added after settlement. A freshly authenticated restored file retains the ordinary product semantics.
 
 ## Create-only ownership

@@ -5376,20 +5376,35 @@ final class DatabaseViewModel {
             isCloudRefreshPending = resolution.status == .refreshSkipped
             hasPendingCloudUploads = pendingUploadMarkerCheck(resolution.reference)
             unlockStatusMessage = Self.decryptingStatusMessage
-            let mergedReference = await Task.detached { () -> DatabaseReference? in
+            let readReference = await Task.detached { () -> DatabaseReference in
                 guard resolution.pendingUploadSources.isEmpty,
                       let observed = observedReference.cloudSyncMetadata,
-                      let learned = resolution.reference.cloudSyncMetadata else { return nil }
-                return DatabaseListStore.updateCloudSyncMetadata(for: observedReference.id, ifUnchangedFrom: observed) {
+                      let learned = resolution.reference.cloudSyncMetadata else { return observedReference }
+                let update = DatabaseListStore.compareAndUpdateCloudSyncMetadata(for: observedReference.id, ifUnchangedFrom: observed) {
                     $0.remoteContentHash = learned.remoteContentHash
                     $0.remoteModifiedAt = learned.remoteModifiedAt
                     $0.remoteRev = learned.remoteRev
                     $0.lastSyncedAt = learned.lastSyncedAt
                     $0.lastSyncIssue = learned.lastSyncIssue
                 }
+                switch update {
+                case .published:
+                    var reference = observedReference
+                    reference.updateCloudSyncMetadata {
+                        $0.remoteContentHash = learned.remoteContentHash
+                        $0.remoteModifiedAt = learned.remoteModifiedAt
+                        $0.remoteRev = learned.remoteRev
+                        $0.lastSyncedAt = learned.lastSyncedAt
+                        $0.lastSyncIssue = learned.lastSyncIssue
+                    }
+                    return reference
+                case .mismatch, .removed, .writeFailed:
+                    // Bytes already read cannot borrow a newer reference's authority after a rejected CAS.
+                    return observedReference
+                }
             }.value
             guard observedCycle == lockCycleID, databaseReference == observedReference else { throw CancellationError() }
-            databaseReference = mergedReference ?? resolution.reference
+            databaseReference = readReference
             return (resolution.localURL, resolution.data, resolution.status, nil, nil)
         }
 
