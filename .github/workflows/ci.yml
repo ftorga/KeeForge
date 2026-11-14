@@ -64,15 +64,14 @@ jobs:
           for selector in "${selectors[@]}"; do
             selection+=("-only-testing:$TEST_SUITE/$selector")
           done
-          signing=()
+          command=(xcodebuild test -project KeeForge.xcodeproj -scheme "$SCHEME"
+            -destination "$DESTINATION" -skipPackagePluginValidation
+            "${selection[@]}" -resultBundlePath build/focused.xcresult)
           if [[ "$TEST_SUITE" = KeeForgeMacTests ]]; then
-            signing=(CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY=- CODE_SIGN_ENTITLEMENTS= DEVELOPMENT_TEAM= PROVISIONING_PROFILE_SPECIFIER=)
+            command+=(CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY=- CODE_SIGN_ENTITLEMENTS= DEVELOPMENT_TEAM= PROVISIONING_PROFILE_SPECIFIER=)
           fi
           set +e
-          xcodebuild test -project KeeForge.xcodeproj -scheme "$SCHEME" \
-            -destination "$DESTINATION" -skipPackagePluginValidation \
-            "${selection[@]}" "${signing[@]}" \
-            -resultBundlePath build/focused.xcresult 2>&1 | tee build/focused.log
+          "${command[@]}" 2>&1 | tee build/focused.log
           status=${PIPESTATUS[0]}
           xcrun xcresulttool get test-results summary --path build/focused.xcresult --compact > build/summary.json
           set -e
