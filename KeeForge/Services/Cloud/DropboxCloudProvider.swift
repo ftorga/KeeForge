@@ -114,7 +114,11 @@ final class DropboxCloudProvider: CloudProvider, @unchecked Sendable {
         var errorDescription: String? { mapped.errorDescription }
     }
 
-    private init() {}
+    private let clientForAccount: (@Sendable (String) throws -> DropboxClient)?
+
+    init(clientForAccount: (@Sendable (String) throws -> DropboxClient)? = nil) {
+        self.clientForAccount = clientForAccount
+    }
 
     @MainActor
     func authenticate(from anchor: ASPresentationAnchor) async throws -> CloudAccount {
@@ -514,6 +518,7 @@ final class DropboxCloudProvider: CloudProvider, @unchecked Sendable {
     /// access token, so building one per call leaked sessions and forced an
     /// OAuth round-trip per request.
     private func client(for accountId: String) throws -> DropboxClient {
+        if let clientForAccount { return try clientForAccount(accountId) }
         // `withLockUnchecked` because the SDK's client and OAuth manager are not
         // `Sendable`; the lock is what keeps them single-threaded here.
         try state.withLockUnchecked { state in
