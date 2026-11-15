@@ -1,0 +1,138 @@
+name: C creation recovery directed diagnostic
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Exact diagnostic source commit
+        required: true
+permissions:
+  contents: read
+jobs:
+  directed:
+    runs-on: macos-26
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - timeout: 135
+            scheme: KeeForge
+            suite: KeeForgeTests
+            destination: 'platform=iOS Simulator,name=iPhone 17 Pro,OS=latest'
+          - timeout: 120
+            scheme: KeeForgeMac
+            suite: KeeForgeMacTests
+            destination: 'platform=macOS'
+    env:
+      SCHEME: '${{ matrix.scheme }}'
+      SUITE: '${{ matrix.suite }}'
+      DESTINATION: '${{ matrix.destination }}'
+      SOURCE_SHA: '${{ inputs.source_ref }}'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: '${{ inputs.source_ref }}'
+      - name: Verify exact source
+        run: |
+          set -eu
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          mkdir -p build
+          git show -s --format='%H%n%P%n%T' HEAD | tee build/source.txt
+      - name: Configure build
+        env:
+          DROPBOX_APP_KEY: ciplaceholderdropboxappkey
+        run: |
+          set -eu
+          XCODE_PATH=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)
+          sudo xcode-select -s "$XCODE_PATH"
+          xcodebuild -version
+          brew install xcodegen
+          BOOTSTRAP_LOCAL_CONFIG_FROM_ENV=1 ./ci_scripts/prepare_build_config.sh .
+          xcodegen generate
+      - name: Build for testing
+        run: |
+          set -o pipefail
+          build_args=()
+          if [[ "$SUITE" == KeeForgeMacTests ]]; then
+            build_args+=(CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY=- CODE_SIGN_ENTITLEMENTS= DEVELOPMENT_TEAM= PROVISIONING_PROFILE_SPECIFIER=)
+          fi
+          xcodebuild build-for-testing -project KeeForge.xcodeproj -scheme "$SCHEME" -destination "$DESTINATION" -derivedDataPath "$GITHUB_WORKSPACE/build/DerivedData" -skipPackagePluginValidation "${build_args[@]}" 2>&1 | tee build/build.log
+      - name: Directed suites, one execution
+        run: |
+          set -uo pipefail
+          suites=(PendingUploadQueueTests PendingUploadDrainerTests PendingUploadRecoveryTests CloudFileCreationCoordinatorTests DatabaseCreationServiceTests DatabaseCreationViewModelTests CredentialProviderPickerCreationTests DatabaseListStoreTests LocalizationTests KDBXCompatibilityTests CloudDatabaseSaverTests CredentialProviderCoordinatorTests)
+          if [[ "$SUITE" == KeeForgeMacTests ]]; then
+            suites=(PendingUploadQueueTests CloudFileCreationCoordinatorTests DatabaseCreationServiceTests DatabaseCreationViewModelTests)
+          fi
+          methods=(testSaveAsConflictCopyLocalWritesSiblingFileClearsConflict testSaveAsConflictCopyWritesThePoolTheDraftsAttachmentsPointInto testSaveAsConflictCopyCloudUploadsSuffixedFileClearsConflict testConflictCopyRejectsChangedTargetOrFactorsDuringEncryption testConflictCopyToCloudUsesCreateOnlyUploadNeverOverwrite testConflictCopyToCloudDoesNotRetryAnAmbiguousConflict testConflictCopyToCloudSurfacesNonConflictFailuresImmediately testConflictCopyFilenameCarriesSecondsSoNearbyResolutionsDiffer testConflictingSaveCompletingAfterLockDoesNotRaiseAConflictPrompt)
+          args=()
+          for suite in "${suites[@]}"; do args+=("-only-testing:$SUITE/$suite"); done
+          for method in "${methods[@]}"; do args+=("-only-testing:$SUITE/DatabaseViewModelTests/$method"); done
+          printf '%s\n' "${args[@]}" > build/selectors.txt
+          test "$(sort build/selectors.txt | uniq -d | wc -l | tr -d ' ')" = 0
+          set +e
+          xcodebuild test-without-building -project KeeForge.xcodeproj -scheme "$SCHEME" -destination "$DESTINATION" -derivedDataPath "$GITHUB_WORKSPACE/build/DerivedData" -parallel-testing-enabled NO "${args[@]}" -resultBundlePath "$GITHUB_WORKSPACE/build/directed.xcresult" 2>&1 | tee build/directed.log
+          status=${PIPESTATUS[0]}
+          set -e
+          python3 ci_scripts/validate_xcresult_summary.py --result-bundle build/directed.xcresult --suite "$SUITE" --xcodebuild-exit "$status"
+          xcrun xcresulttool get test-results tests --path build/directed.xcresult --compact > build/directed-tests.json
+          xcrun xcresulttool get test-results summary --path build/directed.xcresult --compact > build/directed-summary.json
+      - name: Two-process restart, seed then resume
+        if: matrix.suite == 'KeeForgeMacTests'
+        run: |
+          set -euo pipefail
+          export C_FIXTURE_DIR="$GITHUB_WORKSPACE/scratch/cloud-modularization/restart-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          products="$GITHUB_WORKSPACE/build/DerivedData/Build/Products"
+          mapfile=()
+          while IFS= read -r line; do mapfile+=("$line"); done < <(find "$products" -maxdepth 1 -name '*.xctestrun' -type f)
+          test "${#mapfile[@]}" -eq 1
+          export C_XCTESTRUN="${mapfile[0]}"
+          export C_PRODUCTS="$products"
+          python3 - <<'PY'
+          import os, plistlib
+          with open(os.environ['C_XCTESTRUN'], 'rb') as stream: base = plistlib.load(stream)
+          assert 'KeeForgeMacTests' in base
+          for phase in ('seed', 'resume'):
+              with open(os.environ['C_XCTESTRUN'], 'rb') as stream: data = plistlib.load(stream)
+              for key in ('EnvironmentVariables', 'TestingEnvironmentVariables'):
+                  env = data['KeeForgeMacTests'].setdefault(key, {})
+                  env['KEEPFORGE_CREATION_RESTART_DIR'] = os.environ['C_FIXTURE_DIR']
+                  env['KEEPFORGE_CREATION_RESTART_PHASE'] = phase
+              with open(os.path.join(os.environ['C_PRODUCTS'], 'creation-' + phase + '.xctestrun'), 'wb') as stream:
+                  plistlib.dump(data, stream)
+          PY
+          for phase in seed resume; do
+            set +e
+            xcodebuild test-without-building -xctestrun "$products/creation-$phase.xctestrun" -destination 'platform=macOS' -parallel-testing-enabled NO -only-testing:KeeForgeMacTests/CloudFileCreationCoordinatorTests/testOptInTwoProcessRestart -resultBundlePath "$GITHUB_WORKSPACE/build/restart-$phase.xcresult" 2>&1 | tee "build/restart-$phase.log"
+            status=${PIPESTATUS[0]}
+            set -e
+            python3 ci_scripts/validate_xcresult_summary.py --result-bundle "build/restart-$phase.xcresult" --suite KeeForgeMacTests --xcodebuild-exit "$status"
+            xcrun xcresulttool get test-results summary --path "build/restart-$phase.xcresult" --compact > "build/restart-$phase-summary.json"
+            python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["passedTests"] == 1 and d["skippedTests"] == 0' "build/restart-$phase-summary.json"
+          done
+      - name: Render iPhone and iPad recovery in English and Spanish
+        if: matrix.suite == 'KeeForgeTests'
+        run: |
+          set -euo pipefail
+          xcrun simctl list devices available -j > build/simulators.json
+          for device in phone ipad; do
+            sim=$(python3 -c 'import json,sys; d=json.load(open("build/simulators.json")); devices=[x for v in d["devices"].values() for x in v if x.get("isAvailable")]; names=[x for x in devices if (x["name"].startswith("iPhone 17 Pro") if sys.argv[1]=="phone" else x["name"].startswith("iPad"))]; assert names; print(names[0]["udid"])' "$device")
+            scripts/render-views.sh "$sim" en es 2>&1 | tee "build/render-$device.log"
+          done
+          for lang in en es; do
+            find scratch/view-renders -path "*/$lang/cloud-recovery-iphone.png" -size +0c | grep -q .
+            find scratch/view-renders -path "*/$lang/cloud-recovery-ipad.png" -size +0c | grep -q .
+          done
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: 'creation-directed-${{ matrix.suite }}'
+          path: |
+            build/*.txt
+            build/*.json
+            build/*.log
+            build/*.xcresult
+            scratch/view-renders/**/*.png
+          retention-days: 7
