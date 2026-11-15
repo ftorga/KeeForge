@@ -1,4 +1,4 @@
-name: Split cloud engine focused diagnostics
+name: B Mac14 causal diagnostic
 on:
   workflow_dispatch:
     inputs:
@@ -25,9 +25,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - scheme: KeeForge
-            suite: KeeForgeTests
-            destination: 'platform=iOS Simulator,name=iPhone 17 Pro,OS=latest'
           - scheme: KeeForgeMac
             suite: KeeForgeMacTests
             destination: 'platform=macOS'
@@ -65,45 +62,21 @@ jobs:
           set -uo pipefail
           if [[ "$DIAGNOSTIC_SLICE" = cloud ]]; then
             selectors=(
-              DatabaseViewModelCloudSyncTests/testMergePendingUploadsTransfersTheAutoFillChangeToDurableOwnerThenDelivers
-              DatabaseViewModelCloudSyncTests/testMergePendingUploadsKeepsUnsavedEditsInTheUpload
-              DatabaseViewModelCloudSyncTests/testMergePendingUploadsWhenTheCloudCopyChangedAgainKeepsTheMarker
-              DatabaseViewModelCloudSyncTests/testMergePendingUploadsThatHitANewerCloudCopySucceedsAfterSyncNow
-              DatabaseViewModelCloudSyncTests/testMergePendingUploadsWhoseUploadFailsKeepsTheMarker
-              DatabaseViewModelCloudSyncTests/testMergePendingUploadsWithTheChangeGoneFromTheDeviceWritesNothing
-              DatabaseViewModelCloudSyncTests/testMergePendingUploadsWithAnUnprovenMarkerWritesNothingAndKeepsIt
-              DatabaseViewModelCloudSyncTests/testMergePendingUploadsWithAnUnreadableChangeWritesNothing
-              DatabaseViewModelCloudSyncTests/testMergePendingUploadsWithDivergedAttachmentsWritesNothing
-              DatabaseViewModelCloudSyncTests/testMergePendingUploadsRefusesARemoteRefIntoAFileTheUnsavedEditAdded
-              DatabaseViewModelCloudSyncTests/testAnOrdinarySaveRetainsTheConflictedSourceUntilExplicitOwnedMerge
-              DatabaseViewModelCloudSyncTests/testPendingUploadConflictIsNotOfferedForAReadOnlyDatabase
-              DatabaseViewModelCloudSyncTests/testLockingClearsThePendingUploadState
-              DatabaseViewModelCloudSyncTests/testSyncStatusBannerLeavesAConflictedUploadToTheConflictBanner
-              DatabaseViewModelCloudSyncTests/testPendingUploadConflictAvailabilityTracksReadOnlyChanges
-              DatabaseViewModelCloudSyncTests/testPendingUploadConflictIsNotReportedWithoutAConflict
-              DatabaseViewModelCloudSyncTests/testReconciledBaselineEqualToCacheCannotBorrowHashFromOlderRemoteBytes
-              CloudDatabaseSaverTests/testDeliverySkipsDownloadOnlyForContentIdentifyingRevisionOrDigest
-              DatabaseViewModelCloudSyncTests/testMergeNotificationDrainerCannotTakeLeaseBeforeOwnedHandoff
-              DatabaseViewModelCloudSyncTests/testOldCloudOpenResolutionCannotOverwriteAConfirmedRekeyOrResurrectRemoval
-              DatabaseViewModelCloudSyncTests/testPublishedCloudReadMetadataDoesNotImportConcurrentReferenceFields
-              DatabaseViewModelCloudSyncTests/testCloudMetadataWriteFailureLeavesSyncAndForegroundHistoricalAndCacheReadable
-              WebDAVCloudProviderTests/testJournalFencesCurrent412ButNeverRetriesAnUncertainWebDAVPut
-              FTPCloudProviderTests/testJournalFencesOnlyFTPPreflightAndRetainsLostInstallReply
-              DatabaseViewModelCloudSyncTests/testLockAndCancellationBeforeMergeSaverKeepSourcesAndPreventLateEffects
-              DatabaseCreationServiceTests
-              DatabaseCreationViewModelTests
+              CloudDatabaseSaverTests/testSaveStaleRevWithByteIdenticalRemoteProceedsWithFreshRev
+              CloudDatabaseSaverTests/testSaveWithoutRecordedRevUploadsWhenRemoteContentHashStillMatches
+              DatabaseViewModelCloudSyncTests/testSyncAndConflictOnOneDatabasePreserveTheOtherSessionsCloudState
+              DatabaseViewModelCloudSyncTests/testSyncNowDoesNotRollBackASaveThatFinishedMidSync
+              DatabaseViewModelCloudSyncTests/testSyncNowKeepsASaveThatLandedDuringItsDownloadThroughTheRealCache
+              DatabaseViewModelCloudSyncTests/testSyncNowWaitsOutASaveStillInFlightWhenItsResponseArrives
+              DatabaseViewModelTests/testChangeEncryptionSettingsCloudAdoptsTheUploadedRevision
+              DatabaseViewModelTests/testChangeMasterKeyCloudRekeyAppliedRemotelyStillRefreshesStoredKey
+              DatabaseViewModelTests/testChangeMasterKeyCloudRoutesNewKeyThroughCloudSaveOperation
+              DatabaseViewModelTests/testCloudParseFailureIncludesSyncDiagnosticsWithoutPrivateIdentifiers
+              DatabaseViewModelTests/testMergeAndSaveCloudGatesOnConflictBytesAndKeepsRecordedRevision
+              ExpressUnlockTests/testCloudSaveReturnsTheKeyOfTheUploadedBytes
+              LocalDatabaseSaverTests/testSaveCloudReferenceResolvedToCacheWritesCacheExactlyOnce
+              PendingUploadRecoveryTests/test_live_findsTheAutoFillSaveInTheBackupAfterTheCacheWasReplaced
             )
-            if [[ "$TEST_SUITE" = KeeForgeTests ]]; then
-              selectors+=(
-                DropboxCloudProviderTests/testSDKUncertainUploadResponsesRetainAttemptWithoutSecondRequest
-                DropboxCloudProviderTests/testSDKProbeInterceptionIsRestrictedToItsRegisteredHost
-                OneDriveCloudProviderTests/testReplacementLostAcknowledgementsKeepOneAttemptAcrossSimpleAndChunkBoundaries
-                OneDriveCloudProviderTests/testInitialSimplePut412FencesOnlyItsAttemptAndAllowsExplicitDelivery
-                OneDriveCloudProviderTests/testReplacementAuthenticationFailureNeverDispatchesContentAndFencesOnlyItsAttempt
-                OneDriveCloudProviderTests/testShippedCreateKeepsChunkRetryAndFailConflictBehavior
-                OneDriveCloudProviderTests/testReplacementChunkSuccessCrossesBoundaryWithoutRetries
-              )
-            fi
           elif [[ "$DIAGNOSTIC_SLICE" = cloudcas ]]; then
             selectors=(DatabaseViewModelCloudSyncTests/testOldCloudOpenResolutionCannotOverwriteAConfirmedRekeyOrResurrectRemoval)
           else
