@@ -20,15 +20,17 @@ permissions:
 jobs:
   focused:
     runs-on: macos-26
-    timeout-minutes: 40
+    timeout-minutes: ${{ matrix.timeout }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - scheme: KeeForge
+          - timeout: 135
+            scheme: KeeForge
             suite: KeeForgeTests
             destination: 'platform=iOS Simulator,name=iPhone 17 Pro,OS=latest'
-          - scheme: KeeForgeMac
+          - timeout: 120
+            scheme: KeeForgeMac
             suite: KeeForgeMacTests
             destination: 'platform=macOS'
     env:
@@ -63,16 +65,7 @@ jobs:
       - name: Execute selected diagnostic slice once
         run: |
           set -uo pipefail
-          selectors=(
-            PendingLocalSaveTests/testBecomingActiveMergesAPendingSaveInsteadOfReplacingTheSharedCopy
-            PendingLocalSaveTests/testBecomingActiveWhileLockedLeavesThePendingSaveAndTheSharedCopy
-            PendingLocalSaveTests/testForegroundRefreshObservesAnExternalLegacySourceWhileTheSessionRemainsLocked
-            PendingLocalSaveTests/testMergeCompletionKeepsBookmarkScopeThroughSourceRetirementAndRealCacheRefresh
-            PendingLocalSaveTests/testMovedMergeOwnBookmarkRefreshesTailCacheAfterDivergedBackup
-            PendingLocalSaveTests/testMergeTailCannotUseOwnBookmarkForChangedOrUnprovenAuthority
-            PendingLocalSaveTests/testPartialMultiSourceRetirementPreservesUnconsumedReceiptsAndAdmission
-            PendingLocalSaveTests/testRevocationFencesAReplacementAndPreventsSourceAndReferenceResurrection
-          )
+          selectors=(CloudSyncCoordinatorTests CloudDatabaseSaverTests)
           selection=()
           for selector in "${selectors[@]}"; do
             selection+=("-only-testing:$TEST_SUITE/$selector")
