@@ -64,8 +64,25 @@ jobs:
         run: |
           set -uo pipefail
           selectors=(
+            CredentialProviderSaveTests
+            DatabaseListStoreTests
+            DatabaseReferenceMigrationTests
+            DocumentsVaultScannerTests
+            ExpressUnlockTests
+            LocalDatabaseSaverTests
+            PendingLocalSaveTests
+            PendingUploadDrainerTests
+            CloudDatabaseSaverTests/testDeliverySkipsDownloadOnlyForContentIdentifyingRevisionOrDigest
             CloudDatabaseSaverTests/testSaveStaleRevWithByteIdenticalRemoteProceedsWithFreshRev
+            CloudDatabaseSaverTests/testSaveWithoutRecordedRevRejectsDifferentBytesDespiteMatchingHash
             CloudDatabaseSaverTests/testSaveWithoutRecordedRevUploadsWhenRemoteContentHashStillMatches
+            DatabaseViewModelCloudSyncTests/testCloudMetadataWriteFailureLeavesSyncAndForegroundHistoricalAndCacheReadable
+            DatabaseViewModelCloudSyncTests/testDrainStateRefreshDoesNotReviveLockedOrRetiredSessions
+            DatabaseViewModelCloudSyncTests/testMergePendingUploadsKeepsUnsavedEditsInTheUpload
+            DatabaseViewModelCloudSyncTests/testOfflineBoundDescendantsSurviveReopenAndDeliverInOrder
+            DatabaseViewModelCloudSyncTests/testOldCloudOpenResolutionCannotOverwriteAConfirmedRekeyOrResurrectRemoval
+            DatabaseViewModelCloudSyncTests/testPublishedLegacyPendingMergeCreatesNewBoundOwner
+            DatabaseViewModelCloudSyncTests/testReconciledBaselineEqualToCacheCannotBorrowHashFromOlderRemoteBytes
             DatabaseViewModelCloudSyncTests/testSyncAndConflictOnOneDatabasePreserveTheOtherSessionsCloudState
             DatabaseViewModelCloudSyncTests/testSyncNowDoesNotRollBackASaveThatFinishedMidSync
             DatabaseViewModelCloudSyncTests/testSyncNowKeepsASaveThatLandedDuringItsDownloadThroughTheRealCache
@@ -74,30 +91,16 @@ jobs:
             DatabaseViewModelTests/testChangeMasterKeyCloudRekeyAppliedRemotelyStillRefreshesStoredKey
             DatabaseViewModelTests/testChangeMasterKeyCloudRoutesNewKeyThroughCloudSaveOperation
             DatabaseViewModelTests/testCloudParseFailureIncludesSyncDiagnosticsWithoutPrivateIdentifiers
-            DatabaseViewModelTests/testMergeAndSaveCloudGatesOnConflictBytesAndKeepsRecordedRevision
-            ExpressUnlockTests/testCloudSaveReturnsTheKeyOfTheUploadedBytes
-            LocalDatabaseSaverTests/testSaveCloudReferenceResolvedToCacheWritesCacheExactlyOnce
-            PendingUploadRecoveryTests/test_live_findsTheAutoFillSaveInTheBackupAfterTheCacheWasReplaced
-            ExpressUnlockTests/testCloudSaveDoesNotUploadWhenRemoteBytesDiffer
-            LocalDatabaseSaverTests/testUnregisteredCloudReferenceCannotReplaceCacheOrCreateJournal
             DatabaseViewModelTests/testCloudParseFailureRejectsForeignResolutionMetadata
-            CloudDatabaseSaverTests/testSaveWithoutRecordedRevRejectsDifferentBytesDespiteMatchingHash
             DatabaseViewModelTests/testCloudRekeyUnknownUploadRetainsPayloadWithoutResending
-            DatabaseViewModelCloudSyncTests/testReconciledBaselineEqualToCacheCannotBorrowHashFromOlderRemoteBytes
-            CloudDatabaseSaverTests/testDeliverySkipsDownloadOnlyForContentIdentifyingRevisionOrDigest
-            DatabaseViewModelCloudSyncTests/testOldCloudOpenResolutionCannotOverwriteAConfirmedRekeyOrResurrectRemoval
-            DatabaseViewModelTests/testConfirmedCloudRekeyRecoveryDoesNotResurrectLockedOrRetiredSessions
             DatabaseViewModelTests/testConfirmedCloudRekeyRecoveryDoesNotPublishAfterAnotherAction
+            DatabaseViewModelTests/testConfirmedCloudRekeyRecoveryDoesNotResurrectLockedOrRetiredSessions
             DatabaseViewModelTests/testConfirmedCloudRekeyRecoveryRejectsChangedEpoch
-            DatabaseViewModelCloudSyncTests/testDrainStateRefreshDoesNotReviveLockedOrRetiredSessions
             DatabaseViewModelTests/testConfirmedCloudRekeyRevocationDuringPublicationRejectsKeyEffects
+            DatabaseViewModelTests/testMergeAndSaveCloudGatesOnConflictBytesAndKeepsRecordedRevision
+            PendingUploadQueueTests/test_bindingRejectsCollidingAccountsAndChangedFactors
             PendingUploadQueueTests/test_dropMarkersWithPayloadSHA_dropsFinalizedMatchesIncludingConflicted_keepsOthersExcludedAndUnproven
-            DatabaseListStoreTests/testEnablingDisabledDatabaseDoesNotPopulateOrClaimPointer
-            DatabaseListStoreTests/testNoRenewResolutionKeepsRegistryCacheAndOwnerUntouchedForBrokenTrashAndMovedBookmarks
-            DatabaseListStoreTests/testRelinkStaysUnverifiedUntilTheDatabaseOpens
-            DatabaseViewModelCloudSyncTests/testMergePendingUploadsKeepsUnsavedEditsInTheUpload
-            DatabaseViewModelCloudSyncTests/testPublishedLegacyPendingMergeCreatesNewBoundOwner
-            DatabaseViewModelCloudSyncTests/testOfflineBoundDescendantsSurviveReopenAndDeliverInOrder
+            PendingUploadRecoveryTests/test_live_findsTheAutoFillSaveInTheBackupAfterTheCacheWasReplaced
           )
           selection=()
           for selector in "${selectors[@]}"; do
