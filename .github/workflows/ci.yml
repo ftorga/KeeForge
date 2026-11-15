@@ -1,4 +1,4 @@
-name: B grouped contract regressions
+name: B owner recovery regressions
 on:
   workflow_dispatch:
     inputs:
@@ -87,6 +87,10 @@ jobs:
               DatabaseViewModelCloudSyncTests/testReconciledBaselineEqualToCacheCannotBorrowHashFromOlderRemoteBytes
               CloudDatabaseSaverTests/testDeliverySkipsDownloadOnlyForContentIdentifyingRevisionOrDigest
               DatabaseViewModelCloudSyncTests/testOldCloudOpenResolutionCannotOverwriteAConfirmedRekeyOrResurrectRemoval
+              DatabaseViewModelTests/testConfirmedCloudRekeyRecoveryDoesNotResurrectLockedOrRetiredSessions
+              DatabaseViewModelTests/testConfirmedCloudRekeyRecoveryDoesNotPublishAfterAnotherAction
+              DatabaseViewModelTests/testConfirmedCloudRekeyRecoveryRejectsChangedEpoch
+              DatabaseViewModelCloudSyncTests/testDrainStateRefreshDoesNotReviveLockedOrRetiredSessions
             )
           elif [[ "$DIAGNOSTIC_SLICE" = cloudcas ]]; then
             selectors=(DatabaseViewModelCloudSyncTests/testOldCloudOpenResolutionCannotOverwriteAConfirmedRekeyOrResurrectRemoval)
