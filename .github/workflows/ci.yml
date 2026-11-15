@@ -95,6 +95,9 @@ jobs:
             CloudDatabaseSaverTests
             DatabaseViewModelCloudSyncTests/testMergePendingUploadsKeepsUnsavedEditsInTheUpload
             DatabaseViewModelCloudSyncTests/testOfflineKnownSaveCompletesSessionBookkeepingWithoutOptionalKeyPublicationOrRepeatedEncryption
+            DatabaseViewModelCloudSyncTests/testOfflineBoundDescendantsSurviveReopenAndDeliverInOrder
+            DatabaseViewModelCloudSyncTests/testRecoveredRekeyAllowsFreshUnlockAndOrdinarySaveWithPriorOwnerEpoch
+            DatabaseViewModelCloudSyncTests/testUncertainRekeyRetirementKeepsPayloadAndAllowsFreshUnlock
             PendingUploadRecoveryTests
             DatabaseViewModelCloudSyncTests/testPublishedLegacyPendingMergeCreatesNewBoundOwner
             DatabaseListStoreTests
