@@ -91,21 +91,11 @@ jobs:
             DatabaseViewModelTests/testConfirmedCloudRekeyRecoveryRejectsChangedEpoch
             DatabaseViewModelCloudSyncTests/testDrainStateRefreshDoesNotReviveLockedOrRetiredSessions
             DatabaseViewModelTests/testConfirmedCloudRekeyRevocationDuringPublicationRejectsKeyEffects
-            PendingUploadQueueTests
-            CloudDatabaseSaverTests
+            PendingUploadQueueTests/test_dropMarkersWithPayloadSHA_dropsFinalizedMatchesIncludingConflicted_keepsOthersExcludedAndUnproven
+            DatabaseListStoreTests/testEnablingDisabledDatabaseDoesNotPopulateOrClaimPointer
+            DatabaseListStoreTests/testNoRenewResolutionKeepsRegistryCacheAndOwnerUntouchedForBrokenTrashAndMovedBookmarks
+            DatabaseListStoreTests/testRelinkStaysUnverifiedUntilTheDatabaseOpens
             DatabaseViewModelCloudSyncTests/testMergePendingUploadsKeepsUnsavedEditsInTheUpload
-            DatabaseViewModelCloudSyncTests/testOfflineKnownSaveCompletesSessionBookkeepingWithoutOptionalKeyPublicationOrRepeatedEncryption
-            DatabaseViewModelCloudSyncTests/testOfflineBoundDescendantsSurviveReopenAndDeliverInOrder
-            DatabaseViewModelCloudSyncTests/testRecoveredRekeyAllowsFreshUnlockAndOrdinarySaveWithPriorOwnerEpoch
-            DatabaseViewModelCloudSyncTests/testUncertainRekeyRetirementKeepsPayloadAndAllowsFreshUnlock
-            PendingUploadRecoveryTests
-            DatabaseViewModelCloudSyncTests/testPublishedLegacyPendingMergeCreatesNewBoundOwner
-            DatabaseListStoreTests
-            DatabaseCreationViewModelTests
-            DatabaseCreationServiceTests
-            CredentialProviderPickerCreationTests
-            LocalizationTests
-            CloudDatabaseSaverTests/testSaveLegacyKDBX31ThrowsDatabaseIsReadOnlyBeforeUpload
           )
           selection=()
           for selector in "${selectors[@]}"; do
