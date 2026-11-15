@@ -96,6 +96,8 @@ jobs:
             DatabaseListStoreTests/testNoRenewResolutionKeepsRegistryCacheAndOwnerUntouchedForBrokenTrashAndMovedBookmarks
             DatabaseListStoreTests/testRelinkStaysUnverifiedUntilTheDatabaseOpens
             DatabaseViewModelCloudSyncTests/testMergePendingUploadsKeepsUnsavedEditsInTheUpload
+            DatabaseViewModelCloudSyncTests/testPublishedLegacyPendingMergeCreatesNewBoundOwner
+            DatabaseViewModelCloudSyncTests/testOfflineBoundDescendantsSurviveReopenAndDeliverInOrder
           )
           selection=()
           for selector in "${selectors[@]}"; do
