@@ -1,4 +1,4 @@
-name: B Mac14 causal diagnostic
+name: B grouped contract regressions
 on:
   workflow_dispatch:
     inputs:
@@ -25,6 +25,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - scheme: KeeForge
+            suite: KeeForgeTests
+            destination: 'platform=iOS Simulator,name=iPhone 17 Pro,OS=latest'
           - scheme: KeeForgeMac
             suite: KeeForgeMacTests
             destination: 'platform=macOS'
@@ -76,6 +79,14 @@ jobs:
               ExpressUnlockTests/testCloudSaveReturnsTheKeyOfTheUploadedBytes
               LocalDatabaseSaverTests/testSaveCloudReferenceResolvedToCacheWritesCacheExactlyOnce
               PendingUploadRecoveryTests/test_live_findsTheAutoFillSaveInTheBackupAfterTheCacheWasReplaced
+              ExpressUnlockTests/testCloudSaveDoesNotUploadWhenRemoteBytesDiffer
+              LocalDatabaseSaverTests/testUnregisteredCloudReferenceCannotReplaceCacheOrCreateJournal
+              DatabaseViewModelTests/testCloudParseFailureRejectsForeignResolutionMetadata
+              CloudDatabaseSaverTests/testSaveWithoutRecordedRevRejectsDifferentBytesDespiteMatchingHash
+              DatabaseViewModelTests/testCloudRekeyUnknownUploadRetainsPayloadWithoutResending
+              DatabaseViewModelCloudSyncTests/testReconciledBaselineEqualToCacheCannotBorrowHashFromOlderRemoteBytes
+              CloudDatabaseSaverTests/testDeliverySkipsDownloadOnlyForContentIdentifyingRevisionOrDigest
+              DatabaseViewModelCloudSyncTests/testOldCloudOpenResolutionCannotOverwriteAConfirmedRekeyOrResurrectRemoval
             )
           elif [[ "$DIAGNOSTIC_SLICE" = cloudcas ]]; then
             selectors=(DatabaseViewModelCloudSyncTests/testOldCloudOpenResolutionCannotOverwriteAConfirmedRekeyOrResurrectRemoval)
