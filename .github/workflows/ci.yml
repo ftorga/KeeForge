@@ -20,17 +20,15 @@ permissions:
 jobs:
   focused:
     runs-on: macos-26
-    timeout-minutes: ${{ matrix.timeout }}
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
         include:
-          - timeout: 135
-            scheme: KeeForge
+          - scheme: KeeForge
             suite: KeeForgeTests
             destination: 'platform=iOS Simulator,name=iPhone 17 Pro,OS=latest'
-          - timeout: 120
-            scheme: KeeForgeMac
+          - scheme: KeeForgeMac
             suite: KeeForgeMacTests
             destination: 'platform=macOS'
     env:
@@ -65,49 +63,16 @@ jobs:
       - name: Execute selected diagnostic slice once
         run: |
           set -uo pipefail
-          if [[ "$TEST_SUITE" = KeeForgeMacTests ]]; then
-            selectors=(PendingUploadDrainerTests)
-          else
-            selectors=(
-              CredentialProviderSaveTests
-              DatabaseListStoreTests
-              DatabaseReferenceMigrationTests
-              DocumentsVaultScannerTests
-              ExpressUnlockTests
-              LocalDatabaseSaverTests
-              PendingLocalSaveTests
-              PendingUploadDrainerTests
-              CloudDatabaseSaverTests/testDeliverySkipsDownloadOnlyForContentIdentifyingRevisionOrDigest
-              CloudDatabaseSaverTests/testSaveStaleRevWithByteIdenticalRemoteProceedsWithFreshRev
-              CloudDatabaseSaverTests/testSaveWithoutRecordedRevRejectsDifferentBytesDespiteMatchingHash
-              CloudDatabaseSaverTests/testSaveWithoutRecordedRevUploadsWhenRemoteContentHashStillMatches
-              DatabaseViewModelCloudSyncTests/testCloudMetadataWriteFailureLeavesSyncAndForegroundHistoricalAndCacheReadable
-              DatabaseViewModelCloudSyncTests/testDrainStateRefreshDoesNotReviveLockedOrRetiredSessions
-              DatabaseViewModelCloudSyncTests/testMergePendingUploadsKeepsUnsavedEditsInTheUpload
-              DatabaseViewModelCloudSyncTests/testOfflineBoundDescendantsSurviveReopenAndDeliverInOrder
-              DatabaseViewModelCloudSyncTests/testOldCloudOpenResolutionCannotOverwriteAConfirmedRekeyOrResurrectRemoval
-              DatabaseViewModelCloudSyncTests/testPublishedLegacyPendingMergeCreatesNewBoundOwner
-              DatabaseViewModelCloudSyncTests/testReconciledBaselineEqualToCacheCannotBorrowHashFromOlderRemoteBytes
-              DatabaseViewModelCloudSyncTests/testSyncAndConflictOnOneDatabasePreserveTheOtherSessionsCloudState
-              DatabaseViewModelCloudSyncTests/testSyncNowDoesNotRollBackASaveThatFinishedMidSync
-              DatabaseViewModelCloudSyncTests/testSyncNowKeepsASaveThatLandedDuringItsDownloadThroughTheRealCache
-              DatabaseViewModelCloudSyncTests/testSyncNowWaitsOutASaveStillInFlightWhenItsResponseArrives
-              DatabaseViewModelTests/testChangeEncryptionSettingsCloudAdoptsTheUploadedRevision
-              DatabaseViewModelTests/testChangeMasterKeyCloudRekeyAppliedRemotelyStillRefreshesStoredKey
-              DatabaseViewModelTests/testChangeMasterKeyCloudRoutesNewKeyThroughCloudSaveOperation
-              DatabaseViewModelTests/testCloudParseFailureIncludesSyncDiagnosticsWithoutPrivateIdentifiers
-              DatabaseViewModelTests/testCloudParseFailureRejectsForeignResolutionMetadata
-              DatabaseViewModelTests/testCloudRekeyUnknownUploadRetainsPayloadWithoutResending
-              DatabaseViewModelTests/testConfirmedCloudRekeyRecoveryDoesNotPublishAfterAnotherAction
-              DatabaseViewModelTests/testConfirmedCloudRekeyRecoveryDoesNotResurrectLockedOrRetiredSessions
-              DatabaseViewModelTests/testConfirmedCloudRekeyRecoveryRejectsChangedEpoch
-              DatabaseViewModelTests/testConfirmedCloudRekeyRevocationDuringPublicationRejectsKeyEffects
-              DatabaseViewModelTests/testMergeAndSaveCloudGatesOnConflictBytesAndKeepsRecordedRevision
-              PendingUploadQueueTests/test_bindingRejectsCollidingAccountsAndChangedFactors
-              PendingUploadQueueTests/test_dropMarkersWithPayloadSHA_dropsFinalizedMatchesIncludingConflicted_keepsOthersExcludedAndUnproven
-              PendingUploadRecoveryTests/test_live_findsTheAutoFillSaveInTheBackupAfterTheCacheWasReplaced
-            )
-          fi
+          selectors=(
+            PendingLocalSaveTests/testBecomingActiveMergesAPendingSaveInsteadOfReplacingTheSharedCopy
+            PendingLocalSaveTests/testBecomingActiveWhileLockedLeavesThePendingSaveAndTheSharedCopy
+            PendingLocalSaveTests/testForegroundRefreshObservesAnExternalLegacySourceWhileTheSessionRemainsLocked
+            PendingLocalSaveTests/testMergeCompletionKeepsBookmarkScopeThroughSourceRetirementAndRealCacheRefresh
+            PendingLocalSaveTests/testMovedMergeOwnBookmarkRefreshesTailCacheAfterDivergedBackup
+            PendingLocalSaveTests/testMergeTailCannotUseOwnBookmarkForChangedOrUnprovenAuthority
+            PendingLocalSaveTests/testPartialMultiSourceRetirementPreservesUnconsumedReceiptsAndAdmission
+            PendingLocalSaveTests/testRevocationFencesAReplacementAndPreventsSourceAndReferenceResurrection
+          )
           selection=()
           for selector in "${selectors[@]}"; do
             selection+=("-only-testing:$TEST_SUITE/$selector")
