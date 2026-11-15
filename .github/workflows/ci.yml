@@ -1,4 +1,4 @@
-name: PR297 focused diagnostics
+name: Split cloud engine focused diagnostics
 on:
   workflow_dispatch:
     inputs:
@@ -65,20 +65,43 @@ jobs:
           set -uo pipefail
           if [[ "$DIAGNOSTIC_SLICE" = cloud ]]; then
             selectors=(
-              DatabaseViewModelCloudSyncTests/testAnOrdinarySaveRetainsTheConflictedSourceUntilExplicitOwnedMerge
-              DatabaseViewModelCloudSyncTests/testCapturedMergeCannotWriteAfterAnotherWindowSettlesThenRekeysOrRemoves
-              DatabaseViewModelCloudSyncTests/testMergePendingUploadsThatHitANewerCloudCopySucceedsAfterSyncNow
               DatabaseViewModelCloudSyncTests/testMergePendingUploadsTransfersTheAutoFillChangeToDurableOwnerThenDelivers
+              DatabaseViewModelCloudSyncTests/testMergePendingUploadsKeepsUnsavedEditsInTheUpload
               DatabaseViewModelCloudSyncTests/testMergePendingUploadsWhenTheCloudCopyChangedAgainKeepsTheMarker
-              DatabaseViewModelCloudSyncTests/testOrdinaryConflictReadsRemoteWithoutOverwritingPendingCacheThenExplicitMergeDeliversAndSavesAgain
+              DatabaseViewModelCloudSyncTests/testMergePendingUploadsThatHitANewerCloudCopySucceedsAfterSyncNow
+              DatabaseViewModelCloudSyncTests/testMergePendingUploadsWhoseUploadFailsKeepsTheMarker
+              DatabaseViewModelCloudSyncTests/testMergePendingUploadsWithTheChangeGoneFromTheDeviceWritesNothing
+              DatabaseViewModelCloudSyncTests/testMergePendingUploadsWithAnUnprovenMarkerWritesNothingAndKeepsIt
+              DatabaseViewModelCloudSyncTests/testMergePendingUploadsWithAnUnreadableChangeWritesNothing
+              DatabaseViewModelCloudSyncTests/testMergePendingUploadsWithDivergedAttachmentsWritesNothing
+              DatabaseViewModelCloudSyncTests/testMergePendingUploadsRefusesARemoteRefIntoAFileTheUnsavedEditAdded
+              DatabaseViewModelCloudSyncTests/testAnOrdinarySaveRetainsTheConflictedSourceUntilExplicitOwnedMerge
+              DatabaseViewModelCloudSyncTests/testPendingUploadConflictIsNotOfferedForAReadOnlyDatabase
+              DatabaseViewModelCloudSyncTests/testLockingClearsThePendingUploadState
+              DatabaseViewModelCloudSyncTests/testSyncStatusBannerLeavesAConflictedUploadToTheConflictBanner
+              DatabaseViewModelCloudSyncTests/testPendingUploadConflictAvailabilityTracksReadOnlyChanges
+              DatabaseViewModelCloudSyncTests/testPendingUploadConflictIsNotReportedWithoutAConflict
+              DatabaseViewModelCloudSyncTests/testReconciledBaselineEqualToCacheCannotBorrowHashFromOlderRemoteBytes
+              CloudDatabaseSaverTests/testDeliverySkipsDownloadOnlyForContentIdentifyingRevisionOrDigest
               DatabaseViewModelCloudSyncTests/testMergeNotificationDrainerCannotTakeLeaseBeforeOwnedHandoff
-              DatabaseViewModelCloudSyncTests/testExternalDrainerLeaseStillRetainsSourcesWithoutSecondCryptoOrResend
               DatabaseViewModelCloudSyncTests/testOldCloudOpenResolutionCannotOverwriteAConfirmedRekeyOrResurrectRemoval
+              DatabaseViewModelCloudSyncTests/testPublishedCloudReadMetadataDoesNotImportConcurrentReferenceFields
+              DatabaseViewModelCloudSyncTests/testCloudMetadataWriteFailureLeavesSyncAndForegroundHistoricalAndCacheReadable
+              WebDAVCloudProviderTests/testJournalFencesCurrent412ButNeverRetriesAnUncertainWebDAVPut
+              FTPCloudProviderTests/testJournalFencesOnlyFTPPreflightAndRetainsLostInstallReply
+              DatabaseViewModelCloudSyncTests/testLockAndCancellationBeforeMergeSaverKeepSourcesAndPreventLateEffects
+              DatabaseCreationServiceTests
+              DatabaseCreationViewModelTests
             )
             if [[ "$TEST_SUITE" = KeeForgeTests ]]; then
               selectors+=(
-                DropboxCloudProviderTests/testSDKAcceptedUploadWithLost503RetainsAttemptWithoutSecondRequest
-                DropboxCloudProviderTests/testSDKCreateLost503AndInitialConflictKeepNilIdentityWithoutRetryOrDelete
+                DropboxCloudProviderTests/testSDKUncertainUploadResponsesRetainAttemptWithoutSecondRequest
+                DropboxCloudProviderTests/testSDKProbeInterceptionIsRestrictedToItsRegisteredHost
+                OneDriveCloudProviderTests/testReplacementLostAcknowledgementsKeepOneAttemptAcrossSimpleAndChunkBoundaries
+                OneDriveCloudProviderTests/testInitialSimplePut412FencesOnlyItsAttemptAndAllowsExplicitDelivery
+                OneDriveCloudProviderTests/testReplacementAuthenticationFailureNeverDispatchesContentAndFencesOnlyItsAttempt
+                OneDriveCloudProviderTests/testShippedCreateKeepsChunkRetryAndFailConflictBehavior
+                OneDriveCloudProviderTests/testReplacementChunkSuccessCrossesBoundaryWithoutRetries
               )
             fi
           elif [[ "$DIAGNOSTIC_SLICE" = cloudcas ]]; then
