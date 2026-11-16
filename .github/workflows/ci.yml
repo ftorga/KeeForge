@@ -45,6 +45,8 @@ jobs:
             -derivedDataPath build/DerivedData -resultBundlePath build/native-regressions.xcresult \
             -parallel-testing-enabled NO -testLanguage en -testRegion US \
             -only-testing:KeeForgeMacTests/MacConnectServerModelTests \
+            -only-testing:KeeForgeMacTests/DatabaseViewModelTests/testFailedWindowCloseSaveKeepsRegistrationSessionAndSecrets \
+            -only-testing:KeeForgeMacTests/MacAlertQueueTests/testRenameDiscardSelectionAndKeyFileGoThroughNativePrompts \
             -only-testing:KeeForgeMacTests/MacWorkspaceSplitViewControllerTests \
             -only-testing:KeeForgeMacTests/AppSettingsViewModelTests/testTimeoutIsPersistedBeforeResettingTheLiveTimerAndUnchangedValuesDoNothing \
             -only-testing:KeeForgeMacTests/DatabaseWindowControllerTests/testCloseAndInvalidationEndWorkspaceSheetsAndAlerts \
@@ -59,7 +61,7 @@ jobs:
           python3 ci_scripts/validate_xcresult_summary.py --result-bundle build/native-regressions.xcresult --suite KeeForgeMacTests --xcodebuild-exit "$status"
           verdict=$?
           xcrun xcresulttool get test-results summary --path build/native-regressions.xcresult --compact > build/native-regressions-summary.json
-          python3 -c 'import json; d=json.load(open("build/native-regressions-summary.json")); assert d["passedTests"]==19 and d["failedTests"]==0 and d["skippedTests"]==0'
+          python3 -c 'import json; d=json.load(open("build/native-regressions-summary.json")); assert d["passedTests"]==21 and d["failedTests"]==0 and d["skippedTests"]==0'
           count_verdict=$?
           test "$verdict" = 0 && test "$count_verdict" = 0
       - name: Upload exact-source receipts
