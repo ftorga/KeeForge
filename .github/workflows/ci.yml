@@ -51,7 +51,7 @@ jobs:
             -only-testing:KeeForgeMacTests/DatabaseWindowControllerTests/testALockedWindowHasNoToolbarAndKeepsItsLayoutAcrossAnUnlock \
             -only-testing:KeeForgeMacTests/DatabaseWindowControllerTests/testShowInLargeTypeTakesTheGateThenShowsOverThisWindowUntilItCloses \
             -only-testing:KeeForgeMacTests/MacWindowCoordinatorTests/testANewDatabaseWindowCascadesFromTheFrontmostOne \
-            -only-testing:KeeForgeMacTests/DatabaseViewModelTests/testAMasterKeyChangeFinishingAfterRemovalDoesNotAddTheDatabaseBack \
+            -only-testing:KeeForgeMacTests/DatabaseViewModelTests/testRemovalDuringInstalledMasterKeyChangeRetainsRecoveryAndRejectsPublication \
             -only-testing:KeeForgeMacTests/DatabaseViewModelCloudSyncTests/testSyncAndConflictOnOneDatabasePreserveTheOtherSessionsCloudState \
             -skipPackagePluginValidation CODE_SIGN_IDENTITY=- CODE_SIGN_ENTITLEMENTS= \
             2>&1 | tee build/native-regressions.log
