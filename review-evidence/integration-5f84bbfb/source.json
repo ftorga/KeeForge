@@ -1,0 +1,6 @@
+{
+  "source": "5f84bbfb54ecb24905991f1e2c6618e5049ee755",
+  "tree": "0b98d57c916c4727ce78ad75b0c7fe2d124c8570",
+  "parent_source": "099d08a40d81b6522b8ab54730a68e622f708d24",
+  "scope": "Unsigned local Mac: selected key-file, recovery, lock, localization and full KDBX compatibility slices; headless sheet skip is not coverage. External reader verifies all emitted artifacts. Native screenshots remain pinned to 9440c2e in the sibling native directory. Required full PR checks remain separate."
+}

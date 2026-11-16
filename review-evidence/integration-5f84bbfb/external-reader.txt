@@ -1,0 +1,2 @@
+KDBX compatibility gate passed for 51 artifacts (13 attachment checks, 49 protected-password checks, 3 TOTP checks, 3 custom-field/history checks, 2 expiry checks, 10 icon/restore-reference checks verified).
+keepassxc-cli 2.8.0
