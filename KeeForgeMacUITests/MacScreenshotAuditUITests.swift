@@ -43,7 +43,7 @@ final class MacScreenshotAuditUITests: MacUITestCase {
     // The bundled test database under presentable names, since the database
     // list and window titles show the injected filename in listing captures.
     override var databaseFixtures: [DatabaseFixture] {
-        if name.contains("EmptyDatabasesWindow") { return [] }
+        if name.contains("EmptyDatabasesWindow") || name.contains("NativeCloudRecovery") { return [] }
         // Attachments, custom fields, tags and a version that differs live only in kitchen-sink.
         if name.contains("EntryVariants") {
             return [DatabaseFixture(resourceName: "kitchen-sink", injectedFilename: "Personal.kdbx")]
@@ -68,6 +68,15 @@ final class MacScreenshotAuditUITests: MacUITestCase {
     }
 
     override func configureLaunch(app: XCUIApplication) throws {
+        app.launchEnvironment["KEEFORGE_UI_REVIEW_ISOLATION"] = "1"
+        app.launchEnvironment["KEEFORGE_UI_REVIEW_PROFILE"] = name.contains("NativeCloud") ? "cloud" : "local"
+        app.launchEnvironment["KEEFORGE_UI_REVIEW_BYTES"] = try fixtureData(resourceName: "test", resourceExtension: "kdbx").base64EncodedString()
+
+        if name.contains("NativeCloudSettings") {
+            app.launchEnvironment["UI_TEST_CLOUD_ACCOUNTS_JSON"] = Self.serverAccountsJSON
+            app.launchEnvironment["UI_TEST_CLOUD_DATABASES_JSON"] = Self.serverDatabasesJSON
+            app.launchEnvironment["UI_TEST_WEBDAV_PAYLOAD_JSON"] = try webDAVPayloadJSON()
+        }
         // The app blocks screen capture by default (`sharingType = .none` on
         // every window), so its windows are excluded from the capture
         // composite: ScreenCaptureKit returns a blank image and a screen-region
@@ -202,7 +211,7 @@ final class MacScreenshotAuditUITests: MacUITestCase {
     /// The window-server record for the app window at `rect`, at any level:
     /// the quick-search panel and context menus float above normal windows.
     private func appScreenWindow(matching rect: CGRect) -> ScreenWindow? {
-        guard let pid = appProcessID else { return nil }
+        guard let pid = appProcessID else { print("Orca capture has no review PID"); return nil }
         return orderedScreenWindows(anyLayer: true).first {
             $0.pid == pid && abs($0.rect.origin.x - rect.origin.x) < 3
                 && abs($0.rect.origin.y - rect.origin.y) < 3
@@ -334,20 +343,34 @@ final class MacScreenshotAuditUITests: MacUITestCase {
             noteSkip(name, reason: "no window-server record for \(captureElement.frame)")
             return
         }
-        guard let image = await Self.windowImage(id: record.id) else {
-            noteSkip(
-                name,
-                reason: "window capture failed — grant Screen Recording to KeeForgeMacUITests-Runner"
-            )
+        guard let image = await captureViaOrca(windowID: record.id, name: name) else {
+            noteSkip(name, reason: "Orca did not return a capture of the selected review window")
+            XCTFail("Required native review capture missing")
             return
         }
-
-        let attachment = XCTAttachment(
-            image: NSImage(cgImage: image, size: NSSize(width: image.width, height: image.height))
-        )
+        let attachment = XCTAttachment(image: image)
         attachment.name = name
         attachment.lifetime = .keepAlways
         add(attachment)
+    }
+
+    private func captureViaOrca(windowID: CGWindowID, name: String) async -> NSImage? {
+        guard let pid = appProcessID else { return nil }
+        let queue = URL(fileURLWithPath: "/Users/federico/Library/Containers/com.keevault.app.uitests.xctrunner/Data/tmp/KeeForgeNativeReviewCapture")
+        do {
+            try FileManager.default.createDirectory(at: queue, withIntermediateDirectories: true)
+            let png = queue.appendingPathComponent(name + ".png")
+            let done = queue.appendingPathComponent(name + ".done")
+            try? FileManager.default.removeItem(at: png)
+            try? FileManager.default.removeItem(at: done)
+            let request = try JSONSerialization.data(withJSONObject: ["pid": Int(pid), "windowID": Int(windowID), "name": name])
+            try request.write(to: queue.appendingPathComponent("request.json"), options: .atomic)
+            let deadline = ContinuousClock.now.advanced(by: .seconds(60))
+            while !FileManager.default.fileExists(atPath: done.path), ContinuousClock.now < deadline {
+                try await Task.sleep(for: .milliseconds(100))
+            }
+            return NSImage(contentsOf: png)
+        } catch { return nil }
     }
 
     private func parentWindow(ofSheet sheet: XCUIElement) -> XCUIElement? {
@@ -406,6 +429,96 @@ final class MacScreenshotAuditUITests: MacUITestCase {
         guard waitForStableForeground() else { return false }
         typeCommandShortcut(key)
         return true
+    }
+
+    func testCaptureNativeCloudRecovery() async {
+        XCTAssertTrue(databasesWindow.waitForExistence(timeout: 15))
+        guard waitForStableForeground() else { XCTFail("The review app never became active"); return }
+        app.menuBars.menuBarItems.element(boundBy: 2).click()
+        let command = app.menuItems["databases.cloud-recovery"].firstMatch
+        XCTAssertTrue(command.waitForExistence(timeout: 5))
+        command.click()
+        let sheet = databasesWindow.sheets["cloud-recovery.sheet"].firstMatch
+        guard sheet.waitForExistence(timeout: 10) else {
+            await snapWindow(databasesWindow, "native-cloud-missing-sheet")
+            attachCaptureReport(); XCTFail("Cloud recovery sheet missing"); return
+        }
+        let retries = sheet.buttons.matching(NSPredicate(format: "identifier ENDSWITH '.retry'"))
+        XCTAssertTrue(retries.firstMatch.waitForExistence(timeout: 10))
+        XCTAssertEqual(retries.count, 1)
+        XCTAssertEqual(sheet.buttons.matching(NSPredicate(format: "identifier ENDSWITH '.finish'")).count, 1)
+        XCTAssertEqual(sheet.buttons.matching(NSPredicate(format: "identifier ENDSWITH '.export'")).count, 3)
+        await snapWindow(sheet, "native-cloud-recovery-states")
+        sheet.typeKey(.return, modifierFlags: [])
+        XCTAssertTrue(sheet.waitForNonExistence(timeout: 5))
+        attachCaptureReport()
+    }
+
+    func testCaptureNativeLocalRecovery() async {
+        XCTAssertTrue(databasesWindow.waitForExistence(timeout: 15))
+        guard waitForStableForeground(), let row = selectDatabaseRow(containing: "Personal") else {
+            XCTFail("The locked review database was not available"); return
+        }
+        XCTAssertEqual(databaseWindows.count, 0)
+        row.rightClick()
+        let details = app.menuItems["database-row.details"].firstMatch
+        XCTAssertTrue(details.waitForExistence(timeout: 5))
+        details.click()
+        let window = databasesWindow
+        let sheet = window.sheets["database-settings.sheet"].firstMatch
+        guard sheet.waitForExistence(timeout: 10) else {
+            await snapWindow(window, "native-local-missing-sheet")
+            attachCaptureReport(); XCTFail("Database Settings sheet missing"); return
+        }
+        let export = sheet.buttons["database-details.local-recovery.export"].firstMatch
+        XCTAssertTrue(export.waitForExistence(timeout: 10))
+        await snapWindow(sheet, "native-local-recovery-locked")
+        let discard = sheet.buttons["database-details.local-recovery.discard"].firstMatch
+        XCTAssertTrue(discard.waitForExistence(timeout: 5))
+        discard.click()
+        let confirmation = sheet.sheets.firstMatch
+        XCTAssertTrue(confirmation.waitForExistence(timeout: 5))
+        await snapWindow(confirmation, "native-local-recovery-discard")
+        confirmation.typeKey(.return, modifierFlags: [])
+        XCTAssertTrue(confirmation.waitForNonExistence(timeout: 5))
+        XCTAssertTrue(export.exists, "Return must cancel the destructive confirmation")
+        export.click()
+        let panel = sheet.sheets.firstMatch
+        XCTAssertTrue(panel.waitForExistence(timeout: 10))
+        XCTAssertTrue(panel.textFields["saveAsNameTextField"].waitForExistence(timeout: 5))
+        await snapWindow(panel, "native-local-recovery-export-panel")
+        panel.typeKey(.escape, modifierFlags: [])
+        XCTAssertTrue(panel.waitForNonExistence(timeout: 5))
+        XCTAssertTrue(export.exists)
+        sheet.buttons["database-settings.done"].click()
+        XCTAssertTrue(sheet.waitForNonExistence(timeout: 5))
+        attachCaptureReport()
+    }
+
+    func testCaptureNativeCloudSettingsRecovery() async {
+        XCTAssertTrue(databasesWindow.waitForExistence(timeout: 15))
+        guard waitForStableForeground(), let row = selectDatabaseRow(containing: "Family") else {
+            XCTFail("The locked cloud review database was not available"); return
+        }
+        row.rightClick()
+        let details = app.menuItems["database-row.details"].firstMatch
+        XCTAssertTrue(details.waitForExistence(timeout: 5))
+        details.click()
+        let settings = databasesWindow.sheets["database-settings.sheet"].firstMatch
+        XCTAssertTrue(settings.waitForExistence(timeout: 10))
+        let recovery = settings.buttons["database-details.cloud-recovery"].firstMatch
+        XCTAssertTrue(recovery.waitForExistence(timeout: 5))
+        recovery.click()
+        let sheet = settings.sheets["cloud-recovery.sheet"].firstMatch
+        XCTAssertTrue(sheet.waitForExistence(timeout: 10))
+        XCTAssertTrue(sheet.buttons.matching(NSPredicate(format: "identifier ENDSWITH '.retry'")).firstMatch.waitForExistence(timeout: 10))
+        await snapWindow(sheet, "native-cloud-recovery-from-locked-settings")
+        sheet.typeKey(.return, modifierFlags: [])
+        XCTAssertTrue(sheet.waitForNonExistence(timeout: 5))
+        XCTAssertTrue(settings.exists)
+        settings.buttons["database-settings.done"].click()
+        XCTAssertTrue(settings.waitForNonExistence(timeout: 5))
+        attachCaptureReport()
     }
 
     func testCaptureEmptyDatabasesWindow() async {

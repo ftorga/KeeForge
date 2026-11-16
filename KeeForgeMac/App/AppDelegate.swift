@@ -37,6 +37,7 @@ final class AppDelegate: NSResponder, NSApplicationDelegate, NSMenuItemValidatio
     func applicationDidFinishLaunching(_ notification: Notification) {
         guard !didLaunch else { return }
         didLaunch = true
+        seedReviewRecovery()
         appAppearance.start()
         AutoFillDiagnostics.migrateLegacyLogLocation()
         screenProtectionService.update(sceneIsActive: NSApp.isActive)
@@ -90,6 +91,38 @@ final class AppDelegate: NSResponder, NSApplicationDelegate, NSMenuItemValidatio
             whatsNewRelease: transitionNotice ? nil : WhatsNewPresentationService.releaseToPresent(),
             automaticOpenID: transitionNotice ? nil : listViewModel.databaseToAutoOpenOnLaunch()?.id
         )
+    }
+
+    private func seedReviewRecovery() {
+        let env = ProcessInfo.processInfo.environment
+        guard env["KEEFORGE_UI_REVIEW_ISOLATION"] == "1",
+              let encoded = env["KEEFORGE_UI_REVIEW_BYTES"], let bytes = Data(base64Encoded: encoded) else { return }
+        do {
+            let refs = DatabaseListStore.databases
+            if env["KEEFORGE_UI_REVIEW_PROFILE"] == "local", let reference = refs.first {
+                _ = try PendingLocalSaveStore.prepareSource(bytes, for: reference.id, baseCacheSHA512: FileDigest.sha512(bytes))
+            } else if env["KEEFORGE_UI_REVIEW_PROFILE"] == "cloud" {
+                let account = "review-" + UUID().uuidString
+                for (index, name) in ["Prepared.kdbx", "Attempting.kdbx", "Confirmed.kdbx"].enumerated() {
+                    let operationID = UUID()
+                    let template = DatabaseReference(id: UUID(), nickname: nil, filename: name, bookmarkData: nil,
+                        keyFileBookmarkData: nil, keyFileFilename: nil, isQuickLaunch: false, lastOpenedAt: nil,
+                        addedAt: .now, colorTag: nil, legacyKeychainFilename: nil)
+                    let record = try PendingUploadQueue.prepareCreation(operationID: operationID, provider: "webdav",
+                        accountID: account, target: "/" + name, payload: bytes, referenceTemplate: template, isConflictCopy: false)
+                    if index > 0 {
+                        let attempting = try PendingUploadQueue.transitionCreation(record, to: .attempting)
+                        if index == 2 {
+                            var receipt = template
+                            receipt.source = .cloud(CloudSyncMetadata(provider: "webdav", accountId: account, fileId: "created",
+                                displayPath: "/" + name, remoteContentHash: nil, remoteModifiedAt: nil, lastSyncedAt: nil, lastSyncIssue: nil))
+                            receipt.updateCloudSyncMetadata { $0.localHeadOperationID = operationID }
+                            _ = try PendingUploadQueue.transitionCreation(attempting, to: .confirmed, receipt: receipt)
+                        }
+                    }
+                }
+            }
+        } catch { preconditionFailure("Review fixture setup failed: \(error)") }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }

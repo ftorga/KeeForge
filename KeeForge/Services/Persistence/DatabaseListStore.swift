@@ -2260,7 +2260,7 @@ enum DatabaseListStore {
         guard ProcessInfo.processInfo.arguments.contains(uiTestingLaunchArg) else { return }
         didBootstrapUITesting = true
 
-        removeUITestDocumentsDatabases()
+        if ProcessInfo.processInfo.environment["KEEFORGE_UI_REVIEW_ISOLATION"] != "1" { removeUITestDocumentsDatabases() }
 
         var references =
             uiTestLocalDatabaseReferences()

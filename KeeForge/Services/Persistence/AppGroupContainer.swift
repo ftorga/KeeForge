@@ -28,7 +28,7 @@ enum AppGroupContainer {
     /// Always false in Release, where no unit-test host exists.
     static let isRedirectedForTesting: Bool = {
         #if DEBUG
-        ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
+        ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil || ProcessInfo.processInfo.environment["KEEFORGE_UI_REVIEW_ISOLATION"] == "1"
         #else
         false
         #endif
@@ -56,12 +56,12 @@ enum AppGroupContainer {
         UserDefaults(suiteName: identifier) ?? .standard
     }
 
-    private static let testSuiteName = identifier + ".unit-tests"
+    private static let testSuiteName = identifier + ".review-ui-tests"
 
     /// Emptied on first use so a previous run's leftovers cannot leak in.
     private static let testContainerURL: URL = {
         let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("KeeForgeUnitTestAppGroup", isDirectory: true)
+            .appendingPathComponent("KeeForgeReviewUITestAppGroup", isDirectory: true)
             .appendingPathComponent(identifier, isDirectory: true)
         try? FileManager.default.removeItem(at: url)
         try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
