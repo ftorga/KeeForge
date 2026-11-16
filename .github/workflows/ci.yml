@@ -1,36 +1,33 @@
-name: Exact-source recovery renders
+name: Exact-source native CI regressions
 on:
   workflow_dispatch:
     inputs:
       source_ref:
-        description: Exact creation recovery source SHA
+        description: Exact source SHA to validate
         required: true
 permissions:
   contents: read
 env:
   SOURCE_SHA: ${{ inputs.source_ref }}
 concurrency:
-  group: creation-final-${{ inputs.source_ref }}
+  group: native-regressions-${{ inputs.source_ref }}
   cancel-in-progress: false
-
 jobs:
-  recovery-render:
+  native-regressions:
     runs-on: macos-26
-    timeout-minutes: 135
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.source_ref }}
-          fetch-depth: 0
-      - name: Verify fixed source and record identity
+      - name: Record exact source
         run: |
           set -eu
           [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
-          git merge-base --is-ancestor b0f9a6b6d9c19953a966820485ba534a029808ff HEAD
           mkdir -p build
-          git show -s --format='%H%n%P%n%T' HEAD | tee build/render-source.txt
-      - name: Configure renderer
+          git show -s --format='%H%n%P%n%T' HEAD | tee build/source.txt
+      - name: Configure native build
         env:
           DROPBOX_APP_KEY: ciplaceholderdropboxappkey
         run: |
@@ -41,43 +38,32 @@ jobs:
           brew install xcodegen
           BOOTSTRAP_LOCAL_CONFIG_FROM_ENV=1 ./ci_scripts/prepare_build_config.sh .
           xcodegen generate
-      - name: Build render fixture
+      - name: Run native regressions without retries
         run: |
-          set -euo pipefail
-          xcrun simctl list devices available -j > build/render-devices.json
-          phone=$(python3 -c 'import json; d=json.load(open("build/render-devices.json")); a=[x for v in d["devices"].values() for x in v if x.get("isAvailable") and x["name"].startswith("iPhone 17 Pro")]; assert a; print(a[0]["udid"])')
-          xcodebuild build-for-testing -project KeeForge.xcodeproj -scheme KeeForge -destination "platform=iOS Simulator,id=$phone" -derivedDataPath "$GITHUB_WORKSPACE/build/render-dd" -skipPackagePluginValidation 2>&1 | tee build/render-build.log
-      - name: Render local and cloud recovery in nine locales
-        run: |
-          set -euo pipefail
-          region() { case "$1" in en) echo US;; de) echo DE;; fr) echo FR;; es) echo ES;; zh-Hans) echo CN;; zh-Hant) echo TW;; ja) echo JP;; it) echo IT;; ru) echo RU;; esac; }
-          mkdir -p build/render-results
-          for device in phone ipad; do
-            sim=$(python3 -c 'import json,sys; d=json.load(open("build/render-devices.json")); a=[x for v in d["devices"].values() for x in v if x.get("isAvailable") and (x["name"].startswith("iPhone 17 Pro") if sys.argv[1]=="phone" else x["name"].startswith("iPad"))]; assert a; print(a[0]["udid"])' "$device")
-            for lang in en de fr es zh-Hans zh-Hant ja it ru; do
-              result="$GITHUB_WORKSPACE/build/render-results/$device-$lang.xcresult"
-              set +e
-              TEST_RUNNER_VIEW_RENDER_DIR="$GITHUB_WORKSPACE/build/render/$device" xcodebuild test-without-building -project KeeForge.xcodeproj -scheme KeeForge -destination "platform=iOS Simulator,id=$sim" -derivedDataPath "$GITHUB_WORKSPACE/build/render-dd" -parallel-testing-enabled NO -only-testing:KeeForgeTests/ViewRenderTests/testCloudRecoveryCreationStates -only-testing:KeeForgeTests/ViewRenderTests/testLocalSaveRecovery -testLanguage "$lang" -testRegion "$(region "$lang")" -resultBundlePath "$result" > "build/render-$device-$lang.log" 2>&1
-              status=$?
-              set -e
-              python3 ci_scripts/validate_xcresult_summary.py --result-bundle "$result" --suite KeeForgeTests --xcodebuild-exit "$status"
-              xcrun xcresulttool get test-results summary --path "$result" --compact > "build/render-$device-$lang-summary.json"
-              python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["passedTests"]==2 and d["skippedTests"]==0' "build/render-$device-$lang-summary.json"
-              if [[ "$device" == phone ]]; then file=cloud-recovery-iphone.png; else file=cloud-recovery-ipad.png; fi
-              test -s "$GITHUB_WORKSPACE/build/render/$device/$lang/$file"
-              test -s "$GITHUB_WORKSPACE/build/render/$device/$lang/local-save-recovery.png"
-            done
-          done
-      - name: Upload render evidence
+          set -uo pipefail
+          xcodebuild test -project KeeForge.xcodeproj -scheme KeeForgeMac -destination 'platform=macOS' \
+            -derivedDataPath build/DerivedData -resultBundlePath build/native-regressions.xcresult \
+            -parallel-testing-enabled NO -testLanguage en -testRegion US \
+            -only-testing:KeeForgeMacTests/MacConnectServerModelTests \
+            -only-testing:KeeForgeMacTests/MacWorkspaceSplitViewControllerTests \
+            -skipPackagePluginValidation CODE_SIGN_IDENTITY=- CODE_SIGN_ENTITLEMENTS= \
+            2>&1 | tee build/native-regressions.log
+          status=${PIPESTATUS[0]}
+          python3 ci_scripts/validate_xcresult_summary.py --result-bundle build/native-regressions.xcresult --suite KeeForgeMacTests --xcodebuild-exit "$status"
+          verdict=$?
+          xcrun xcresulttool get test-results summary --path build/native-regressions.xcresult --compact > build/native-regressions-summary.json
+          python3 -c 'import json; d=json.load(open("build/native-regressions-summary.json")); assert d["passedTests"]==12 and d["failedTests"]==0 and d["skippedTests"]==0'
+          count_verdict=$?
+          test "$verdict" = 0 && test "$count_verdict" = 0
+      - name: Upload exact-source receipts
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: local-and-cloud-recovery-render
+          name: native-regressions
           path: |
-            build/render-source.txt
-            build/render-*.log
-            build/render-*-summary.json
-            build/render/**/*.png
-            build/render-results/*.xcresult
-          if-no-files-found: warn
+            build/source.txt
+            build/native-regressions.log
+            build/native-regressions-summary.json
+            build/native-regressions.xcresult
           retention-days: 14
+          if-no-files-found: warn
