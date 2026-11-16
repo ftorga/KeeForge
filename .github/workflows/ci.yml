@@ -108,6 +108,7 @@ jobs:
             -derivedDataPath build/DerivedData -resultBundlePath build/shared-regressions.xcresult \
             -parallel-testing-enabled NO -testLanguage en -testRegion US \
             -only-testing:KeeForgeTests/DatabaseViewModelTests/testRemovalDuringInstalledMasterKeyChangeRetainsRecoveryAndRejectsPublication \
+            -only-testing:KeeForgeTests/AppSettingsViewModelTests/testTimeoutIsPersistedBeforeResettingTheLiveTimerAndUnchangedValuesDoNothing \
             -only-testing:KeeForgeTests/DatabaseViewModelCloudSyncTests/testSyncAndConflictOnOneDatabasePreserveTheOtherSessionsCloudState \
             -skipPackagePluginValidation CODE_SIGNING_ALLOWED=NO \
             2>&1 | tee build/shared-regressions.log
@@ -115,7 +116,7 @@ jobs:
           python3 ci_scripts/validate_xcresult_summary.py --result-bundle build/shared-regressions.xcresult --suite KeeForgeTests --xcodebuild-exit "$status"
           verdict=$?
           xcrun xcresulttool get test-results summary --path build/shared-regressions.xcresult --compact > build/shared-regressions-summary.json
-          python3 -c 'import json; d=json.load(open("build/shared-regressions-summary.json")); assert d["passedTests"]==2 and d["failedTests"]==0 and d["skippedTests"]==0'
+          python3 -c 'import json; d=json.load(open("build/shared-regressions-summary.json")); assert d["passedTests"]==3 and d["failedTests"]==0 and d["skippedTests"]==0'
           count_verdict=$?
           test "$verdict" = 0 && test "$count_verdict" = 0
       - name: Upload exact-source receipts
