@@ -3,7 +3,6 @@
     {
       "device": {
         "architecture": "arm64",
-        "deviceId": "00008140-000A79A10EBB001C",
         "deviceName": "My Mac",
         "modelName": "MacBook Neo",
         "osBuildNumber": "26B131",
@@ -20,15 +19,15 @@
       }
     }
   ],
-  "environmentDescription": "KeeForgeMac \u00b7 Built with macOS 27.2.1",
+  "environmentDescription": "KeeForgeMac · Built with macOS 27.2.1",
   "expectedFailures": 0,
   "failedTests": 0,
-  "finishTime": 1794792803.117,
+  "finishTime": 1794796645.303,
   "passedTests": 3,
   "result": "Passed",
   "runtimeWarnings": [],
   "skippedTests": 0,
-  "startTime": 1794792728.914,
+  "startTime": 1794796513.787,
   "statistics": [],
   "testFailures": [],
   "title": "Test - KeeForgeMac",

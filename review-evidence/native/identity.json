@@ -1,28 +1,28 @@
 {
-  "base_source": "1de4e84781f534c0eaf7c0b5c36385083ba0e509",
+  "base_source": "9440c2edb8f7a85ae7f3957393037b622e72e3a3",
   "locale": "es",
   "appearance": "light",
   "unique_ui_cases": 3,
   "captures": [
     {
       "file": "native-cloud-recovery-states.png",
-      "sha256": "47f6677a2ef7ee1c060e678639da9717c53845f68e41f87997b0fb9ca0abdd18"
+      "sha256": "18be375a28af89b1b6f8d6cd6b69efd826d50d2babee6d622289e0aa4a63248c"
     },
     {
       "file": "native-cloud-recovery-from-locked-settings.png",
-      "sha256": "a65bf9c7827652902d07d8ed7a4ec24c5a1e2719d27e896abc4c78ff67cf3d30"
+      "sha256": "8aff4c5e7597a573f24e299238b4832c40b3c6e66a49b9fc878d18884e72ccd5"
     },
     {
       "file": "native-local-recovery-export-panel.png",
-      "sha256": "fae75dd494a67fa6a0c6b5a858c2c103c850045e95d440f59cb9ec9d522dd0f5"
+      "sha256": "98f736d49d7ab6a5625e24f1c05de03e5d050598b5bedfe025f0a02678b32484"
     },
     {
       "file": "native-local-recovery-discard.png",
-      "sha256": "aba5f6d034f8b7c89c08dde777b4101b81b4c3b1f004108bf806a246c707bb94"
+      "sha256": "551a0b81946cabd9c960438b6b5e4c97069c0f596ea9983537fe6d10931b5539"
     },
     {
       "file": "native-local-recovery-locked.png",
-      "sha256": "efc15af0841fd89b1fecb584489e38a4bca7532f4e241167bd04f1beb5189252"
+      "sha256": "d5b47576fd45d29225aaa6d21cc1d4ca58fe529b256020c6ea6811ef7135becc"
     }
   ],
   "scope": [
@@ -39,5 +39,6 @@
     "Ad hoc build with entitlements stripped",
     "No real Keychain, hardware, provider accounts, signed app/extension lifecycle or power-loss validation",
     "Spanish light appearance only; terminal security-warning forms covered by unit/sheet tests, not these captures"
-  ]
+  ],
+  "tested_harness": "4d8380b4b6ff2a6b889630249ca4af01e1eeb161"
 }
