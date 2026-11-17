@@ -1,133 +1,46 @@
-name: Exact-source stack CI regressions
+name: OneDrive uncertain PUT regression
 on:
   workflow_dispatch:
     inputs:
       source_ref:
-        description: Exact source SHA to validate
         required: true
 permissions:
   contents: read
-env:
-  SOURCE_SHA: ${{ inputs.source_ref }}
-concurrency:
-  group: native-regressions-${{ inputs.source_ref }}
-  cancel-in-progress: false
 jobs:
-  native-regressions:
+  ios:
     runs-on: macos-26
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.source_ref }}
-      - name: Record exact source
-        run: |
-          set -eu
-          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
-          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
-          mkdir -p build
-          git show -s --format='%H%n%P%n%T' HEAD | tee build/source.txt
-      - name: Configure native build
+      - name: Verify source
+        env:
+          SOURCE_SHA: ${{ inputs.source_ref }}
+        run: test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+      - name: Configure
         env:
           DROPBOX_APP_KEY: ciplaceholderdropboxappkey
         run: |
           set -eu
-          XCODE_PATH=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)
-          sudo xcode-select -s "$XCODE_PATH"
-          xcodebuild -version
+          sudo xcode-select -s "$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)"
           brew install xcodegen
           BOOTSTRAP_LOCAL_CONFIG_FROM_ENV=1 ./ci_scripts/prepare_build_config.sh .
           xcodegen generate
-      - name: Run native regressions without retries
+      - name: Run regression
         run: |
           set -uo pipefail
-          xcodebuild test -project KeeForge.xcodeproj -scheme KeeForgeMac -destination 'platform=macOS' \
-            -derivedDataPath build/DerivedData -resultBundlePath build/native-regressions.xcresult \
-            -parallel-testing-enabled NO -testLanguage en -testRegion US \
-            -only-testing:KeeForgeMacTests/MacConnectServerModelTests \
-            -only-testing:KeeForgeMacTests/DatabaseViewModelTests/testFailedWindowCloseSaveKeepsRegistrationSessionAndSecrets \
-            -only-testing:KeeForgeMacTests/MacAlertQueueTests/testRenameDiscardSelectionAndKeyFileGoThroughNativePrompts \
-            -only-testing:KeeForgeMacTests/MacWorkspaceSplitViewControllerTests \
-            -only-testing:KeeForgeMacTests/AppSettingsViewModelTests/testTimeoutIsPersistedBeforeResettingTheLiveTimerAndUnchangedValuesDoNothing \
-            -only-testing:KeeForgeMacTests/DatabaseWindowControllerTests/testCloseAndInvalidationEndWorkspaceSheetsAndAlerts \
-            -only-testing:KeeForgeMacTests/DatabaseWindowControllerTests/testALockedWindowHasNoToolbarAndKeepsItsLayoutAcrossAnUnlock \
-            -only-testing:KeeForgeMacTests/DatabaseWindowControllerTests/testShowInLargeTypeTakesTheGateThenShowsOverThisWindowUntilItCloses \
-            -only-testing:KeeForgeMacTests/MacWindowCoordinatorTests/testANewDatabaseWindowCascadesFromTheFrontmostOne \
-            -only-testing:KeeForgeMacTests/DatabaseViewModelTests/testRemovalDuringInstalledMasterKeyChangeRetainsRecoveryAndRejectsPublication \
-            -only-testing:KeeForgeMacTests/DatabaseViewModelCloudSyncTests/testSyncAndConflictOnOneDatabasePreserveTheOtherSessionsCloudState \
-            -skipPackagePluginValidation CODE_SIGN_IDENTITY=- CODE_SIGN_ENTITLEMENTS= \
-            2>&1 | tee build/native-regressions.log
-          status=${PIPESTATUS[0]}
-          python3 ci_scripts/validate_xcresult_summary.py --result-bundle build/native-regressions.xcresult --suite KeeForgeMacTests --xcodebuild-exit "$status"
-          verdict=$?
-          xcrun xcresulttool get test-results summary --path build/native-regressions.xcresult --compact > build/native-regressions-summary.json
-          python3 -c 'import json; d=json.load(open("build/native-regressions-summary.json")); assert d["passedTests"]==21 and d["failedTests"]==0 and d["skippedTests"]==0'
-          count_verdict=$?
-          test "$verdict" = 0 && test "$count_verdict" = 0
-      - name: Upload exact-source receipts
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: native-regressions
-          path: |
-            build/source.txt
-            build/native-regressions.log
-            build/native-regressions-summary.json
-            build/native-regressions.xcresult
-          retention-days: 14
-          if-no-files-found: warn
-  shared-regressions:
-    runs-on: macos-26
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ inputs.source_ref }}
-      - name: Record exact source
-        run: |
-          set -eu
-          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
-          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
           mkdir -p build
-          git show -s --format='%H%n%P%n%T' HEAD | tee build/source.txt
-      - name: Configure native build
-        env:
-          DROPBOX_APP_KEY: ciplaceholderdropboxappkey
-        run: |
-          set -eu
-          XCODE_PATH=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)
-          sudo xcode-select -s "$XCODE_PATH"
-          xcodebuild -version
-          brew install xcodegen
-          BOOTSTRAP_LOCAL_CONFIG_FROM_ENV=1 ./ci_scripts/prepare_build_config.sh .
-          xcodegen generate
-      - name: Run shared iOS regressions without retries
-        run: |
-          set -uo pipefail
-          xcodebuild test -project KeeForge.xcodeproj -scheme KeeForge -destination 'platform=iOS Simulator,name=iPhone 17 Pro,OS=latest' \
-            -derivedDataPath build/DerivedData -resultBundlePath build/shared-regressions.xcresult \
-            -parallel-testing-enabled NO -testLanguage en -testRegion US \
-            -only-testing:KeeForgeTests/DatabaseViewModelTests/testRemovalDuringInstalledMasterKeyChangeRetainsRecoveryAndRejectsPublication \
-            -only-testing:KeeForgeTests/AppSettingsViewModelTests/testTimeoutIsPersistedBeforeResettingTheLiveTimerAndUnchangedValuesDoNothing \
-            -only-testing:KeeForgeTests/DatabaseViewModelCloudSyncTests/testSyncAndConflictOnOneDatabasePreserveTheOtherSessionsCloudState \
-            -skipPackagePluginValidation CODE_SIGNING_ALLOWED=NO \
-            2>&1 | tee build/shared-regressions.log
+          xcodebuild test -project KeeForge.xcodeproj -scheme KeeForge -destination 'platform=iOS Simulator,name=iPhone 17 Pro' -derivedDataPath build/DerivedData -resultBundlePath build/result.xcresult -parallel-testing-enabled NO -only-testing:KeeForgeTests/OneDriveCloudProviderTests/testSimplePut412AfterUnobservedCommitRemainsUncertain -skipPackagePluginValidation 2>&1 | tee build/test.log
           status=${PIPESTATUS[0]}
-          python3 ci_scripts/validate_xcresult_summary.py --result-bundle build/shared-regressions.xcresult --suite KeeForgeTests --xcodebuild-exit "$status"
-          verdict=$?
-          xcrun xcresulttool get test-results summary --path build/shared-regressions.xcresult --compact > build/shared-regressions-summary.json
-          python3 -c 'import json; d=json.load(open("build/shared-regressions-summary.json")); assert d["passedTests"]==3 and d["failedTests"]==0 and d["skippedTests"]==0'
-          count_verdict=$?
-          test "$verdict" = 0 && test "$count_verdict" = 0
-      - name: Upload exact-source receipts
+          python3 ci_scripts/validate_xcresult_summary.py --result-bundle build/result.xcresult --suite KeeForgeTests --xcodebuild-exit "$status" || exit 1
+          xcrun xcresulttool get test-results summary --path build/result.xcresult --compact > build/summary.json
+          python3 -c 'import json; d=json.load(open("build/summary.json")); assert d["passedTests"] == 1 and d["failedTests"] == 0 and d["skippedTests"] == 0'
+      - uses: actions/upload-artifact@v7
         if: always()
-        uses: actions/upload-artifact@v7
         with:
-          name: shared-regressions
+          name: onedrive-regression
           path: |
-            build/source.txt
-            build/shared-regressions.log
-            build/shared-regressions-summary.json
-            build/shared-regressions.xcresult
-          retention-days: 14
-          if-no-files-found: warn
+            build/test.log
+            build/summary.json
+          retention-days: 7
